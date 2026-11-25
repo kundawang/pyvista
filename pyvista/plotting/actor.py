@@ -12,7 +12,9 @@ import pyvista_validation as _validation
 import pyvista as pv
 from pyvista import _vtk
 from pyvista._warn_external import warn_external
+from pyvista.core._typing_core import BoundsTuple
 from pyvista.core.utilities.arrays import FieldAssociation
+from pyvista.core.utilities.arrays import array_from_vtkmatrix
 from pyvista.core.utilities.misc import _resolve_line_style
 from pyvista.plotting.utilities.algorithms import set_algorithm_input
 
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
 
     from pyvista import DataSet
     from pyvista.core._typing_core import LineStyle
+    from pyvista.core._typing_core import NumpyArray
 
     from .mapper import _BaseMapper
 
@@ -138,6 +141,22 @@ _DASH_FRAGMENT_IMPL = """//VTK::Color::Impl
 if (((1 << int(mod(abs(dashArc), 16.0))) & dashPattern) == 0)
   discard;
 """
+
+
+def _enlarge_bounds(
+    bounds: NumpyArray[float], extra_bounds: NumpyArray[float]
+) -> NumpyArray[float]:
+    """Return the smallest axis-aligned box enclosing both sets of bounds."""
+    enlarged = bounds.copy()
+    for axis in range(3):
+        lo, hi = 2 * axis, 2 * axis + 1
+        if enlarged[lo] > enlarged[hi]:
+            enlarged[lo] = extra_bounds[lo]
+            enlarged[hi] = extra_bounds[hi]
+        else:
+            enlarged[lo] = min(enlarged[lo], extra_bounds[lo])
+            enlarged[hi] = max(enlarged[hi], extra_bounds[hi])
+    return enlarged
 
 
 class Actor(Prop3D, _vtk.vtkActor):
@@ -266,6 +285,74 @@ class Actor(Prop3D, _vtk.vtkActor):
     def mapper(self, obj: _vtk.vtkMapper | _BaseMapper | None) -> None:
         # VTK's stubs do not allow clearing the mapper with ``None``, but VTK does
         self.SetMapper(obj)  # type: ignore[arg-type]
+
+    @property
+    def bounds(self) -> BoundsTuple:  # numpydoc ignore=RT01
+        """Return the world-coordinate bounds of this actor's dataset.
+
+        Every point of the mapped dataset is included, including points that
+        no cell references. The mapper's bounds only span referenced points, so
+        the bounds are enlarged with the dataset's own bounds when the two
+        differ. The result is expressed in world coordinates, including this
+        actor's position, scale, orientation, and user matrix.
+
+        Examples
+        --------
+        Add an unreferenced point to a mesh and show it is included in the
+        actor's bounds even though the mapper does not render it.
+
+        >>> import numpy as np
+        >>> import pyvista as pv
+        >>> mesh = pv.Sphere()
+        >>> mesh.points = np.vstack([mesh.points, [0.0, 0.0, 1.0]])
+        >>> actor = pv.Actor(mapper=pv.DataSetMapper(mesh))
+        >>> actor.bounds.z_max
+        1.0
+
+        """
+        bounds = self._get_world_bounds()
+        if bounds is None:
+            return BoundsTuple(*self.GetBounds())
+        return BoundsTuple(*bounds)
+
+    def _get_world_bounds(self) -> tuple[float, ...] | None:
+        """Return world-coordinate bounds spanning all dataset points, or ``None``.
+
+        ``None`` is returned when the actor has no mapper or its dataset has no
+        points. The mapper bounds cover every referenced point and are enlarged
+        with the dataset bounds so unreferenced points are included, then the
+        actor's transformation is applied to the bounding-box corners.
+        """
+        mapper = self.mapper
+        if mapper is None or not hasattr(mapper, 'dataset'):
+            return None
+        dataset = mapper.dataset
+        if dataset is None:
+            return None
+        if hasattr(dataset, 'n_points') and dataset.n_points == 0:
+            return None
+        local_bounds = np.array(mapper.GetBounds(), dtype=float)
+        dataset_bounds = np.array(dataset.bounds, dtype=float)
+        local_bounds = _enlarge_bounds(local_bounds, dataset_bounds)
+
+        corners = np.array(
+            [
+                [local_bounds[0], local_bounds[2], local_bounds[4]],
+                [local_bounds[1], local_bounds[2], local_bounds[4]],
+                [local_bounds[0], local_bounds[3], local_bounds[4]],
+                [local_bounds[1], local_bounds[3], local_bounds[4]],
+                [local_bounds[0], local_bounds[2], local_bounds[5]],
+                [local_bounds[1], local_bounds[2], local_bounds[5]],
+                [local_bounds[0], local_bounds[3], local_bounds[5]],
+                [local_bounds[1], local_bounds[3], local_bounds[5]],
+            ]
+        )
+        matrix = array_from_vtkmatrix(self.GetMatrix())
+        world_corners = corners @ matrix[:3, :3].T + matrix[:3, 3]
+        world_bounds = np.empty(6, dtype=float)
+        world_bounds[0::2] = world_corners.min(axis=0)
+        world_bounds[1::2] = world_corners.max(axis=0)
+        return tuple(world_bounds.tolist())
 
     @property
     def prop(self) -> Property:  # numpydoc ignore=RT01

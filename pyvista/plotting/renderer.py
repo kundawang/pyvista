@@ -56,6 +56,7 @@ from .utilities.gl_checks import uses_egl
 if TYPE_CHECKING:
     import cycler
 
+    from pyvista.core._typing_core import NumpyArray
     from pyvista.core._typing_core import RotationLike
     from pyvista.core._typing_core import VectorLike
     from pyvista.core.composite import MultiBlock
@@ -642,7 +643,7 @@ class Renderer(_NoNewAttrMixin, _BoundsSizeMixin, DisableVtkSnakeCase, _vtk.vtkO
 
         This ensures that no props are cut off
         """
-        self.ResetCameraClippingRange()
+        self.ResetCameraClippingRange(*self.bounds)
 
     @property
     def camera(self) -> Camera:  # numpydoc ignore=RT01
@@ -691,8 +692,41 @@ class Renderer(_NoNewAttrMixin, _BoundsSizeMixin, DisableVtkSnakeCase, _vtk.vtkO
             Compute the bounds with options to enable or disable actor visibility.
 
         """
-        bounds = self.ComputeVisiblePropBounds()
+        bounds = self._compute_visible_prop_bounds()
         return _fixup_bounds(bounds)
+
+    def _compute_visible_prop_bounds(self) -> NumpyArray[float]:
+        """Compute visible prop bounds in Python.
+
+        Mirrors :vtk:`vtkRenderer.ComputeVisiblePropBounds`, but reads
+        :attr:`Actor.bounds` so points that no cell references are included.
+        Other props fall back to their VTK bounds.
+        """
+        the_bounds = np.array([np.inf, -np.inf, np.inf, -np.inf, np.inf, -np.inf])
+        for actor in self.actors.values():
+            if not actor.GetUseBounds() or not actor.GetVisibility():
+                continue
+            actor_bounds = self._get_actor_bounds(actor)
+            if actor_bounds is None:
+                continue
+            bounds_array = np.asarray(actor_bounds, dtype=float)
+            for axis in range(3):
+                the_bounds[2 * axis] = min(bounds_array[2 * axis], the_bounds[2 * axis])
+                the_bounds[2 * axis + 1] = max(
+                    bounds_array[2 * axis + 1], the_bounds[2 * axis + 1]
+                )
+        return the_bounds
+
+    @staticmethod
+    def _get_actor_bounds(actor: _vtk.vtkProp) -> Sequence[float] | None:
+        """Return an actor's world bounds, including unreferenced dataset points."""
+        if isinstance(actor, Actor):
+            bounds = actor._get_world_bounds()
+            if bounds is not None:
+                return bounds
+        if hasattr(actor, 'GetBounds'):
+            return actor.GetBounds()
+        return None
 
     def compute_bounds(
         self,
@@ -762,7 +796,8 @@ class Renderer(_NoNewAttrMixin, _BoundsSizeMixin, DisableVtkSnakeCase, _vtk.vtkO
                 or any(isinstance(actor, actor_type) for actor_type in ignored_types)
             ):
                 continue
-            if hasattr(actor, 'GetBounds') and (actor_bounds := actor.GetBounds()) is not None:
+            actor_bounds = self._get_actor_bounds(actor)
+            if actor_bounds is not None:
                 _update_bounds(actor_bounds)
 
         return _fixup_bounds(the_bounds)
@@ -2936,7 +2971,7 @@ class Renderer(_NoNewAttrMixin, _BoundsSizeMixin, DisableVtkSnakeCase, _vtk.vtkO
         y = focus[1] - distance * direction[1]
         z = focus[2] - distance * direction[2]
         self.camera.position = (x, y, z)
-        self.ResetCameraClippingRange()
+        self.reset_camera_clipping_range()
 
         self.camera.disable_parallel_projection()
         self.Modified()
@@ -3219,7 +3254,9 @@ class Renderer(_NoNewAttrMixin, _BoundsSizeMixin, DisableVtkSnakeCase, _vtk.vtkO
         if bounds is not None:
             self.ResetCamera(*bounds)
         else:
-            self.ResetCamera()
+            # Fit from Python-computed bounds so unreferenced dataset points are
+            # included; the C++ no-argument path only sees the mapper's bounds.
+            self.ResetCamera(*_fixup_bounds(self._compute_visible_prop_bounds()))
 
         self.reset_camera_clipping_range()
 

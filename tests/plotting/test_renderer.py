@@ -1375,3 +1375,64 @@ def test_background_image_height_scales_with_window(image_path, scale):
         assert image_height / viewport_height == pytest.approx(scale)
 
     pl.close()
+
+
+def test_renderer_bounds_and_camera_include_unreferenced_points():
+    mesh = pv.Sphere()
+    outlier = np.array([[0.0, 0.0, 5.0]])
+    mesh.points = np.vstack([mesh.points, outlier])
+
+    pl = pv.Plotter()
+    actor = pl.add_mesh(mesh)
+
+    # Public renderer bounds span the unreferenced point even though the mapper does not.
+    assert actor.mapper.bounds.z_max < 5.0
+    assert np.isclose(actor.bounds.z_max, 5.0)
+    assert np.isclose(pl.bounds.z_max, 5.0)
+    assert np.isclose(pl.compute_bounds().z_max, 5.0)
+
+    # Camera fit is identical to an explicit reset against the full dataset bounds.
+    pl.reset_camera()
+    fitted_focal = pl.camera.focal_point
+    fitted_position = pl.camera.position
+
+    pl2 = pv.Plotter()
+    pl2.add_mesh(mesh)
+    pl2.reset_camera(bounds=mesh.bounds)
+    assert np.allclose(fitted_focal, pl2.camera.focal_point)
+    assert np.allclose(fitted_position, pl2.camera.position)
+    pl2.close()
+    pl.close()
+
+
+def test_renderer_bounds_unreferenced_points_respect_visibility():
+    mesh = pv.Sphere()
+    mesh.points = np.vstack([mesh.points, [0.0, 0.0, 5.0]])
+
+    pl = pv.Plotter()
+    pl.add_mesh(pv.Cube())
+    actor = pl.add_mesh(mesh)
+    assert np.isclose(pl.bounds.z_max, 5.0)
+
+    actor.visibility = False
+    assert np.isclose(pl.bounds.z_max, 0.5)
+    assert np.isclose(pl.compute_bounds(force_visibility=True).z_max, 5.0)
+
+    actor.visibility = True
+    actor.use_bounds = False
+    assert np.isclose(pl.bounds.z_max, 0.5)
+    assert np.isclose(pl.compute_bounds(force_use_bounds=True).z_max, 5.0)
+    pl.close()
+
+
+def test_reset_camera_with_empty_mesh_actor():
+    pv.global_theme.allow_empty_mesh = True
+    try:
+        pl = pv.Plotter()
+        pl.add_mesh(pv.Cube())
+        pl.add_mesh(pv.PolyData())
+        pl.reset_camera()
+        assert np.allclose(pl.bounds, pv.Cube().bounds)
+        pl.close()
+    finally:
+        pv.global_theme.allow_empty_mesh = False

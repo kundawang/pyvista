@@ -1054,3 +1054,98 @@ def test_line_style_toggles_after_add():
     assert 0 < drawn('-..') < solid
     assert drawn('-') == solid
     pl.close()
+
+
+@pytest.fixture
+def sphere_with_unreferenced_points():
+    """Sphere mesh with two points no cell references."""
+    mesh = pv.Sphere()
+    outliers = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, 5.0]])
+    mesh.points = np.vstack([mesh.points, outliers])
+    return mesh
+
+
+def test_actor_bounds_include_unreferenced_points(sphere_with_unreferenced_points):
+    mesh = sphere_with_unreferenced_points
+    mapper = pv.DataSetMapper(mesh)
+    # The mapper itself does not span the unreferenced points
+    assert mapper.bounds.z_max < mesh.bounds.z_max
+
+    actor = pv.Actor(mapper=mapper)
+    assert isinstance(actor.bounds, tuple)
+    assert np.allclose(actor.bounds, mesh.bounds)
+
+
+def test_actor_bounds_no_mapper_or_empty():
+    assert np.allclose(pv.Actor().bounds, (1, -1, 1, -1, 1, -1))
+
+    empty_actor = pv.Actor(mapper=pv.DataSetMapper(pv.PolyData()))
+    assert np.allclose(empty_actor.bounds, (1, -1, 1, -1, 1, -1))
+
+
+def test_actor_bounds_cell_less_polydata():
+    mesh = pv.PolyData()
+    mesh.points = np.array([[0.0, 0.0, 10.0], [1.0, 1.0, 11.0]])
+    actor = pv.Actor(mapper=pv.DataSetMapper(mesh))
+    assert np.allclose(actor.bounds, mesh.bounds)
+
+
+def test_actor_bounds_mixed_cells_and_unreferenced_point():
+    mesh = pv.PolyData(
+        np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [5.0, 5.0, 5.0],
+                [2.0, 2.0, 10.0],
+                [9.0, 9.0, 9.0],
+            ]
+        ),
+        faces=[3, 0, 1, 2],
+        lines=[2, 0, 3],
+        verts=[1, 4],
+    )
+    actor = pv.Actor(mapper=pv.DataSetMapper(mesh))
+    assert np.allclose(actor.bounds, mesh.bounds)
+
+
+@pytest.mark.parametrize(
+    ('transform_name', 'apply_transform'),
+    [
+        ('translate', lambda actor: setattr(actor, 'position', (10.0, 0.0, 0.0))),
+        ('scale', lambda actor: setattr(actor, 'scale', (2.0, 3.0, 4.0))),
+        ('rotate', lambda actor: actor.rotate_z(30.0)),
+    ],
+)
+def test_actor_bounds_apply_world_transform(
+    sphere_with_unreferenced_points, transform_name, apply_transform
+):
+    mesh = sphere_with_unreferenced_points
+    actor = pv.Actor(mapper=pv.DataSetMapper(mesh))
+    apply_transform(actor)
+
+    # Reference: transform every dataset point with the actor's own matrix
+    matrix = actor.GetMatrix()
+    transformed = np.array([matrix.MultiplyPoint([*point, 1.0])[:3] for point in mesh.points])
+    expected = np.empty(6)
+    expected[0::2] = transformed.min(axis=0)
+    expected[1::2] = transformed.max(axis=0)
+
+    bounds = actor.bounds
+    # The actor reports an axis-aligned box of the transformed corner box, so it
+    # encloses every transformed point and is tight when no rotation is applied.
+    for axis in range(3):
+        assert bounds[2 * axis] <= expected[2 * axis] + 1e-10
+        assert bounds[2 * axis + 1] >= expected[2 * axis + 1] - 1e-10
+    if transform_name == 'translate':
+        assert np.allclose(bounds, expected)
+
+
+def test_actor_bounds_translation_is_exact(sphere_with_unreferenced_points):
+    mesh = sphere_with_unreferenced_points
+    actor = pv.Actor(mapper=pv.DataSetMapper(mesh))
+    actor.position = (0.0, 0.0, 5.0)
+    expected = np.array(mesh.bounds)
+    expected[4:] += 5.0
+    assert np.allclose(actor.bounds, expected)

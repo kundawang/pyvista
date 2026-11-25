@@ -532,6 +532,9 @@ class DataSetAttributes(_NoNewAttrMixin, DisableVtkSnakeCase, VTKObjectWrapperCh
                 narray = narray.view(np.complex64)  # type: ignore[assignment]
             if narray.dtype == np.float64:
                 narray = narray.view(np.complex128)  # type: ignore[assignment]
+            if narray.ndim == 2 and narray.shape[1] > 1:
+                # multi-component complex vectors keep their component axis
+                return narray
             # remove singleton dimensions to match the behavior of the rest of 1D VTK arrays
             return narray.squeeze()
         return narray
@@ -570,6 +573,11 @@ class DataSetAttributes(_NoNewAttrMixin, DisableVtkSnakeCase, VTKObjectWrapperCh
         You can simply use the ``[]`` operator to add an array to the
         dataset. Note that this will automatically become the active
         scalars.
+
+        .. versionchanged:: 0.50
+            Multi-component complex arrays, such as complex vectors with
+            shape ``(n, 3)``, are supported. They are stored internally as
+            float arrays with twice as many components.
 
         Examples
         --------
@@ -638,8 +646,9 @@ class DataSetAttributes(_NoNewAttrMixin, DisableVtkSnakeCase, VTKObjectWrapperCh
         When adding directional data (such as velocity vectors), use
         :func:`DataSetAttributes.set_vectors`.
 
-        Complex arrays will be represented internally as a 2 component float64
-        array. This is due to limitations of VTK's native datatypes.
+        Complex arrays will be represented internally as a float array with
+        twice as many components (interleaved real and imaginary parts). This
+        is due to limitations of VTK's native datatypes.
 
         Examples
         --------
@@ -721,6 +730,10 @@ class DataSetAttributes(_NoNewAttrMixin, DisableVtkSnakeCase, VTKObjectWrapperCh
             my-vectors              float64    (8, 3)               VECTORS
 
         """
+        if np.asanyarray(vectors).dtype.kind == 'c':
+            msg = 'Complex data cannot be set as vectors. Use `set_array` instead.'
+            raise ValueError(msg)
+
         # prepare the array and add an attribute so that we can track this as a vector
         vtk_arr = self._prepare_array(data=vectors, name=name, deep_copy=deep_copy)
 
@@ -825,18 +838,18 @@ class DataSetAttributes(_NoNewAttrMixin, DisableVtkSnakeCase, VTKObjectWrapperCh
                 )
                 raise ValueError(msg)
 
-            if data.ndim != 1:
-                if data.shape[1] != 1:
-                    msg = 'Complex data must be single dimensional.'
-                    raise ValueError(msg)
+            if data.ndim > 2:
+                msg = f'Complex data must be one or two dimensional, got {data.ndim}.'
+                raise ValueError(msg)
             complex_names.add(name)
 
-            # complex data is stored internally as a contiguous 2 component
-            # float arrays
+            # complex data is stored internally as a contiguous float array
+            # with twice as many components (interleaved real and imag parts)
+            data = np.ascontiguousarray(data)
             if data.dtype == np.complex64:
-                data = data.view(np.float32).reshape(-1, 2)
+                data = data.view(np.float32).reshape(array_len, -1)
             else:
-                data = data.view(np.float64).reshape(-1, 2)
+                data = data.view(np.float64).reshape(array_len, -1)
 
         shape = data.shape
         if data.ndim == 3:

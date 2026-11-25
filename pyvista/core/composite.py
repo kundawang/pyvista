@@ -2722,7 +2722,7 @@ class MultiBlock(
                 # uint8 is required by the mapper to display correctly
                 _validation.check_subdtype(scalars, (np.floating, np.integer), name='rgb scalars')
                 scalars_name = self._convert_to_uint8_rgb_scalars(data_attr, scalars_name)
-        elif np.issubdtype(scalars.dtype, np.complexfloating):
+        elif np.issubdtype(scalars.dtype, np.complexfloating) and scalars.ndim != 2:
             # Use only the real component if an array is complex
             scalars_name = self._convert_to_real_scalars(data_attr, scalars_name)
         elif scalars.dtype in (np.bool_, np.uint8):
@@ -2784,6 +2784,7 @@ class MultiBlock(
             for block in self.recursive_iterator(skip_none=True):
                 scalars = getattr(block, data_attr).get(scalars_name, None)
                 if scalars is not None:
+                    # the norm of a complex array is its true magnitude
                     scalars = np.linalg.norm(scalars, axis=1)
                     dattr = getattr(block, data_attr)
                     dattr[f'{scalars_name}-normed'] = scalars
@@ -2793,8 +2794,12 @@ class MultiBlock(
         for block in self.recursive_iterator(skip_none=True):
             scalars = getattr(block, data_attr).get(scalars_name, None)
             if scalars is not None:
+                component_scalars = scalars[:, component]
+                if np.issubdtype(component_scalars.dtype, np.complexfloating):
+                    # complex vectors plot the magnitude of the component
+                    component_scalars = np.abs(component_scalars)
                 dattr = getattr(block, data_attr)
-                dattr[f'{scalars_name}-{component}'] = scalars[:, component]
+                dattr[f'{scalars_name}-{component}'] = component_scalars
                 dattr.active_scalars_name = f'{scalars_name}-{component}'
         return f'{scalars_name}-{component}'
 

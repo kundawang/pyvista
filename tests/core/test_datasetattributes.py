@@ -732,8 +732,8 @@ def test_complex(plane, dtype_str):
     dtype = np.dtype(dtype_str)
     name = 'my_data'
 
-    with pytest.raises(ValueError, match='Complex data must be single dimensional'):
-        plane.point_data[name] = np.empty((plane.n_points, 2), dtype=dtype)
+    with pytest.raises(ValueError, match='Complex data must be one or two dimensional'):
+        plane.point_data[name] = np.empty((plane.n_points, 2, 2), dtype=dtype)
 
     real_type = np.float32 if dtype == np.complex64 else np.float64
     data = (
@@ -766,6 +766,127 @@ def test_complex_singleton(dtype):
     assert array.dataset.Get() is mesh
     array[...] = 3 + 4j
     assert mesh.point_data['values'].item() == 3 + 4j
+
+
+# hand-built parts with Pythagorean magnitudes, exactly representable in
+# float32 and float64 so the file round trip is lossless
+COMPLEX_VECTOR_REAL = np.array(
+    [
+        [3.0, 0.0, 0.0],
+        [0.0, 4.0, 0.0],
+        [0.0, 0.0, 12.0],
+        [1.0, 2.0, 2.0],
+        [6.0, 0.0, 0.0],
+        [0.0, 8.0, 0.0],
+        [0.0, 0.0, 5.0],
+        [2.0, 3.0, 6.0],
+    ]
+)
+COMPLEX_VECTOR_IMAG = np.array(
+    [
+        [4.0, 0.0, 0.0],
+        [0.0, 3.0, 0.0],
+        [0.0, 0.0, 5.0],
+        [2.0, 2.0, 1.0],
+        [8.0, 0.0, 0.0],
+        [0.0, 6.0, 0.0],
+        [0.0, 0.0, 12.0],
+        [6.0, 3.0, 2.0],
+    ]
+)
+
+
+@pytest.mark.parametrize('dtype', [np.complex64, np.complex128])
+def test_complex_vector_image_data(dtype, tmp_path):
+    """Complex vectors on ImageData keep components, precision, and shape."""
+    grid = pv.ImageData(dimensions=(2, 2, 2))
+    vec = (COMPLEX_VECTOR_REAL + 1j * COMPLEX_VECTOR_IMAG).astype(dtype)
+
+    grid.point_data['vec'] = vec
+    out = grid.point_data['vec']
+    assert out.shape == (grid.n_points, 3)
+    assert out.dtype == dtype
+    assert np.array_equal(np.asarray(out.real), COMPLEX_VECTOR_REAL)
+    assert np.array_equal(np.asarray(out.imag), COMPLEX_VECTOR_IMAG)
+
+    # hand-computed component magnitudes and vector magnitudes
+    expected_mag = np.hypot(COMPLEX_VECTOR_REAL, COMPLEX_VECTOR_IMAG)
+    rtol = 1e-6 if dtype == np.complex64 else 1e-14
+    assert np.allclose(np.abs(out), expected_mag, rtol=rtol)
+    expected_norm = np.sqrt((expected_mag**2).sum(axis=1))
+    assert np.allclose(np.linalg.norm(np.abs(out), axis=1), expected_norm, rtol=rtol)
+
+    # single-component complex and real vectors stay compatible on the same mesh
+    grid.point_data['sc'] = np.full(grid.n_points, 1 + 2j, dtype=dtype)
+    grid.point_data['rv'] = np.ones((grid.n_points, 3))
+
+    # saving and rereading VTI reconstructs the original complex vectors
+    filename = tmp_path / 'vec.vti'
+    grid.save(filename)
+    back = pv.read(filename)
+    restored = back.point_data['vec']
+    assert restored.shape == (grid.n_points, 3)
+    assert restored.dtype == dtype
+    assert np.abs(restored - vec).max() == 0.0
+    assert np.array_equal(back.point_data['sc'], np.full(grid.n_points, 1 + 2j, dtype=dtype))
+    assert np.array_equal(back.point_data['rv'], np.ones((grid.n_points, 3)))
+
+
+def test_complex_vector_raises():
+    """Mismatched length or shape is rejected for complex vectors."""
+    grid = pv.ImageData(dimensions=(2, 2, 2))
+    with pytest.raises(ValueError, match='Invalid array shape'):
+        grid.point_data['vec'] = np.ones((grid.n_points + 1, 3), dtype=np.complex128)
+    with pytest.raises(ValueError, match='Complex data must be one or two dimensional'):
+        grid.point_data['vec'] = np.ones((grid.n_points, 3, 3), dtype=np.complex128)
+
+
+def test_complex_vector_single_point():
+    """A single-point mesh keeps the component axis of complex vectors."""
+    grid = pv.ImageData(dimensions=(1, 1, 1))
+    grid.point_data['vec'] = np.array([[1 + 2j, 3 + 4j, 5 + 6j]])
+    out = grid.point_data['vec']
+    assert out.shape == (1, 3)
+    assert np.array_equal(out, [[1 + 2j, 3 + 4j, 5 + 6j]])
+
+
+def test_complex_vector_cell_data(tmp_path):
+    """Complex vectors round-trip as cell data through VTI."""
+    grid = pv.ImageData(dimensions=(3, 2, 2))
+    vec = np.array([[1 + 2j, 3 + 4j, 5 + 6j], [7 + 8j, 9 + 10j, 11 + 12j]])
+    grid.cell_data['vec'] = vec
+    assert grid.cell_data['vec'].shape == (grid.n_cells, 3)
+    filename = tmp_path / 'vec.vti'
+    grid.save(filename)
+    back = pv.read(filename)
+    assert back.cell_data['vec'].shape == (grid.n_cells, 3)
+    assert np.array_equal(back.cell_data['vec'], vec)
+
+
+def test_complex_single_component_squeezed():
+    """A single-component complex array reads back as one-dimensional."""
+    grid = pv.ImageData(dimensions=(2, 2, 2))
+    grid.point_data['sc'] = np.full((grid.n_points, 1), 1 + 2j, dtype=np.complex128)
+    assert grid.point_data['sc'].shape == (grid.n_points,)
+
+
+def test_complex_vector_non_contiguous():
+    """Non-contiguous complex vectors are accepted."""
+    grid = pv.ImageData(dimensions=(2, 2, 2))
+    strided = np.zeros((grid.n_points, 6), dtype=np.complex128)[:, ::2]
+    strided[...] = 1 + 2j
+    grid.point_data['vec'] = strided
+    assert np.array_equal(grid.point_data['vec'], np.full((grid.n_points, 3), 1 + 2j))
+
+
+def test_set_vectors_complex_raises():
+    """Complex vectors are rejected without corrupting the existing array."""
+    grid = pv.ImageData(dimensions=(2, 2, 2))
+    grid.point_data['data'] = np.arange(grid.n_points * 2.0).reshape(-1, 2)
+    with pytest.raises(ValueError, match='Complex data cannot be set as vectors'):
+        grid.point_data.set_vectors(np.ones((grid.n_points, 3), dtype=np.complex128), 'data')
+    assert grid.point_data['data'].dtype == np.float64
+    assert grid.point_data['data'].shape == (grid.n_points, 2)
 
 
 @pytest.mark.parametrize('copy', [True, False])

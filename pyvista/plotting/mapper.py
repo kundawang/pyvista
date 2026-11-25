@@ -791,7 +791,7 @@ class _BaseDataSetMapper(_BaseMapper):
         if array.size == 0:
             return
         if np.issubdtype(array.dtype, np.complexfloating):
-            array = array.real
+            array = np.abs(array) if array.ndim == 2 else array.real
         if array.dtype == np.bool_:
             clim = (0.0, 1.0)
         elif np.issubdtype(array.dtype, np.number):
@@ -1178,10 +1178,13 @@ class _BaseDataSetMapper(_BaseMapper):
 
             self.lookup_table.SetAnnotations(convert_array(values), convert_string_array(cats))
 
-        # Use only the real component if an array is complex
+        # Complex scalars plot their real component, complex vectors their magnitude
         if np.issubdtype(scalars.dtype, np.complexfloating):
-            scalars = scalars.astype(float)
-            scalars_name = f'{scalars_name}-real'
+            if scalars.ndim == 2:
+                scalars = np.abs(scalars)
+            else:
+                scalars = scalars.astype(float)
+                scalars_name = f'{scalars_name}-real'
 
         if scalars.ndim != 1:
             if rgb:

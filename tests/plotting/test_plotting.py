@@ -4972,6 +4972,77 @@ def test_plot_complex_value(plane, verify_image_cache):
     pl.show()
 
 
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_plot_complex_vector_magnitude():
+    """Complex vectors plot their magnitude through the component reduction path."""
+    grid = pv.ImageData(dimensions=(2, 2, 2))
+    real = np.array(
+        [
+            [3.0, 0.0, 0.0],
+            [0.0, 4.0, 0.0],
+            [0.0, 0.0, 12.0],
+            [1.0, 2.0, 2.0],
+            [6.0, 0.0, 0.0],
+            [0.0, 8.0, 0.0],
+            [0.0, 0.0, 5.0],
+            [2.0, 3.0, 6.0],
+        ]
+    )
+    imag = np.array(
+        [
+            [4.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0],
+            [0.0, 0.0, 5.0],
+            [2.0, 2.0, 1.0],
+            [8.0, 0.0, 0.0],
+            [0.0, 6.0, 0.0],
+            [0.0, 0.0, 12.0],
+            [6.0, 3.0, 2.0],
+        ]
+    )
+    grid.point_data['vec'] = real + 1j * imag
+
+    expected = np.linalg.norm(np.hypot(real, imag), axis=1)
+    pl = pv.Plotter()
+    actor = pl.add_mesh(grid, scalars='vec')
+    assert np.allclose(actor.mapper.scalar_range, (expected.min(), expected.max()))
+    pl.close()
+
+    # a component pick plots the magnitude of that component
+    pl = pv.Plotter()
+    actor = pl.add_mesh(grid, scalars='vec', component=0)
+    expected_comp = np.hypot(real[:, 0], imag[:, 0])
+    assert np.allclose(actor.mapper.scalar_range, (expected_comp.min(), expected_comp.max()))
+    pl.close()
+
+
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_plot_composite_complex_vector_magnitude():
+    """Complex vectors in a MultiBlock plot their magnitude."""
+    blocks = pv.MultiBlock(
+        [pv.ImageData(dimensions=(2, 2, 2)), pv.ImageData(dimensions=(3, 3, 3))]
+    )
+    for block in blocks:
+        real = np.zeros((block.n_points, 3))
+        imag = np.zeros((block.n_points, 3))
+        real[:, 0] = 3.0
+        imag[:, 0] = 4.0  # magnitude 5
+        real[0] = [0.0, 6.0, 0.0]
+        imag[0] = [0.0, 8.0, 0.0]  # first vector has magnitude 10
+        block.point_data['vec'] = real + 1j * imag
+
+    pl = pv.Plotter()
+    _, mapper = pl.add_composite(blocks, scalars='vec')
+    assert np.allclose(mapper.scalar_range, (5.0, 10.0))
+    pl.close()
+
+    # a component pick plots the magnitude of that component
+    pl = pv.Plotter()
+    _, mapper = pl.add_composite(blocks, scalars='vec', component=0)
+    assert np.allclose(mapper.scalar_range, (0.0, 5.0))
+    pl.close()
+
+
 def test_screenshot_notebook(tmpdir):
     tmp_dir = tmpdir.mkdir('tmpdir2')
     filename = str(tmp_dir.join('tmp.png'))

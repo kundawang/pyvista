@@ -6,8 +6,10 @@ See the image regression notes in CONTRIBUTING.rst
 
 from __future__ import annotations
 
+import base64
 import inspect
 from io import BytesIO
+import json
 import os
 from pathlib import Path
 import re
@@ -202,6 +204,210 @@ def test_export_gltf(tmpdir, sphere, airplane, hexbeam, verify_image_cache):
 
     with pytest.raises(RuntimeError, match='This plotter has been closed'):
         pl_import.export_gltf(filename)
+
+
+def _gltf_color_0(filename):
+    """Read the ``COLOR_0`` attribute of the first primitive in a glTF file."""
+    with Path(filename).open() as f:
+        gltf = json.load(f)
+    color_index = gltf['meshes'][0]['primitives'][0]['attributes']['COLOR_0']
+    accessor = gltf['accessors'][color_index]
+    buffer_view = gltf['bufferViews'][accessor['bufferView']]
+    buffer = gltf['buffers'][buffer_view['buffer']]
+    raw = base64.b64decode(buffer['uri'].split(',')[1])
+    colors = np.frombuffer(
+        raw[
+            buffer_view.get('byteOffset', 0) : buffer_view.get('byteOffset', 0)
+            + buffer_view['byteLength']
+        ],
+        dtype=np.uint8,
+    ).reshape(-1, 4)
+    return colors, gltf
+
+
+def _gltf_lut_rgba(mapper, mesh, scalars_name, *, point):
+    attr = mesh.GetPointData() if point else mesh.GetCellData()
+    scalars = attr.GetArray(scalars_name)
+    rgba = mapper.lookup_table.MapScalars(scalars, 0, 0)
+    return np.asarray(rgba).view(np.uint8).reshape(-1, 4)
+
+
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_export_gltf_point_scalar_colors(tmpdir, sphere):
+    filename = str(tmpdir.mkdir('tmpdir').join('point_colors.gltf'))
+    sphere['scalars'] = sphere.points[:, 2]
+
+    pl = pv.Plotter()
+    actor = pl.add_mesh(sphere, scalars='scalars', cmap='bwr', clim=(-1, 1), show_scalar_bar=False)
+    mapper = actor.mapper
+    expected = _gltf_lut_rgba(mapper, sphere, 'scalars', point=True)
+    state = (
+        mapper.GetColorMode(),
+        mapper.GetScalarMode(),
+        mapper.GetArrayName(),
+        mapper.GetScalarVisibility(),
+    )
+    pl.export_gltf(filename)
+    # mapper configuration and the user's dataset are untouched
+    assert (
+        mapper.GetColorMode(),
+        mapper.GetScalarMode(),
+        mapper.GetArrayName(),
+        mapper.GetScalarVisibility(),
+    ) == state
+    assert not any(name.startswith('_PyVistaGLTFColor') for name in sphere.point_data)
+    pl.close()
+
+    colors, gltf = _gltf_color_0(filename)
+    assert 'images' not in gltf
+    assert 'textures' not in gltf
+    np.testing.assert_array_equal(colors, expected)
+
+
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_export_gltf_discrete_colors(tmpdir, sphere):
+    filename = str(tmpdir.mkdir('tmpdir').join('discrete_colors.gltf'))
+    sphere['scalars'] = sphere.points[:, 2]
+
+    pl = pv.Plotter()
+    actor = pl.add_mesh(
+        sphere, scalars='scalars', cmap='viridis', n_colors=4, show_scalar_bar=False
+    )
+    expected = _gltf_lut_rgba(actor.mapper, sphere, 'scalars', point=True)
+    pl.export_gltf(filename)
+    pl.close()
+
+    colors, _ = _gltf_color_0(filename)
+    np.testing.assert_array_equal(colors, expected)
+    assert np.unique(colors[:, :3], axis=0).shape[0] <= 4
+
+
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_export_gltf_cell_scalar_colors(tmpdir):
+    filename = str(tmpdir.mkdir('tmpdir').join('cell_colors.gltf'))
+    cube = pv.Cube().triangulate().compute_normals()
+    cube.cell_data['scalars'] = np.arange(cube.n_cells, dtype=float)
+
+    pl = pv.Plotter()
+    actor = pl.add_mesh(cube, scalars='scalars', cmap='tab10', show_scalar_bar=False)
+    expected = _gltf_lut_rgba(actor.mapper, cube, 'scalars', point=False)
+    pl.export_gltf(filename)
+    assert not any(name.startswith('_PyVistaGLTFColor') for name in cube.cell_data)
+    pl.close()
+
+    colors, gltf = _gltf_color_0(filename)
+    # point duplication must not drop the normals
+    assert 'NORMAL' in gltf['meshes'][0]['primitives'][0]['attributes']
+    # shared points are duplicated so every corner of a face keeps its cell color
+    pl_import = pv.Plotter()
+    pl_import.import_gltf(filename)
+    imported_actor = next(iter(pl_import.renderer.actors.values()))
+    mesh = pv.wrap(imported_actor.GetMapper().GetInputDataObject(0, 0))
+    pl_import.close()
+    assert np.isfinite(mesh.point_data['NORMAL']).all()
+    faces = mesh.faces.reshape(-1, 4)[:, 1:]
+    for face_id, face in enumerate(faces):
+        np.testing.assert_array_equal(colors[face], np.tile(expected[face_id], (face.size, 1)))
+
+
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_export_gltf_cell_scalars_mixed_face_sizes(tmpdir):
+    filename = str(tmpdir.mkdir('tmpdir').join('mixed_faces.gltf'))
+    # one triangle and one quad sharing a point, with a cell scalar per face
+    vertices = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [0, 0, 1]], dtype=float)
+    mesh = pv.PolyData(vertices, faces=[3, 0, 1, 2, 4, 0, 2, 3, 4])
+    mesh.cell_data['scalars'] = np.array([0.0, 1.0])
+
+    pl = pv.Plotter()
+    actor = pl.add_mesh(mesh, scalars='scalars', cmap='bwr', n_colors=2, show_scalar_bar=False)
+    expected = _gltf_lut_rgba(actor.mapper, mesh, 'scalars', point=False)
+    pl.export_gltf(filename)
+    pl.close()
+
+    colors, _ = _gltf_color_0(filename)
+    pl_import = pv.Plotter()
+    pl_import.import_gltf(filename)
+    imported_actor = next(iter(pl_import.renderer.actors.values()))
+    imported = pv.wrap(imported_actor.GetMapper().GetInputDataObject(0, 0))
+    pl_import.close()
+    # The exporter triangulates the quad: cell 0 yields one triangle, cell 1
+    # yields two. Walk every exported triangle and group by its cell color.
+    exported_faces = imported.faces.reshape(-1, 4)[:, 1:]
+    seen_cell_colors = [tuple(colors[face][0]) for face in exported_faces]
+    # each exported triangle is uniform in color
+    for face in exported_faces:
+        assert np.unique(colors[face], axis=0).shape[0] == 1
+    # the first triangle carries cell 0's color, both quad triangles cell 1's
+    np.testing.assert_array_equal(colors[exported_faces[0]][0], expected[0])
+    for face in exported_faces[1:]:
+        np.testing.assert_array_equal(colors[face][0], expected[1])
+    assert len(seen_cell_colors) == 3
+
+
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_export_gltf_no_scalars_has_no_colors(tmpdir, sphere):
+    filename = str(tmpdir.mkdir('tmpdir').join('no_scalars.gltf'))
+    pl = pv.Plotter()
+    pl.add_mesh(sphere, color='red')
+    pl.export_gltf(filename)
+    pl.close()
+
+    with Path(filename).open() as f:
+        gltf = json.load(f)
+    assert 'COLOR_0' not in gltf['meshes'][0]['primitives'][0]['attributes']
+
+
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_export_gltf_texture_is_preserved(tmpdir):
+    filename = str(tmpdir.mkdir('tmpdir').join('texture.gltf'))
+    cube = pv.Cube()
+    cube.point_data['Texture Coordinates'] = np.zeros((cube.n_points, 2))
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+    image[:, :, 1] = 200
+
+    pl = pv.Plotter()
+    pl.add_mesh(cube, texture=pv.Texture(image))
+    pl.export_gltf(filename)
+    pl.close()
+
+    with Path(filename).open() as f:
+        gltf = json.load(f)
+    assert len(gltf['images']) == 1
+    assert 'COLOR_0' not in gltf['meshes'][0]['primitives'][0]['attributes']
+
+
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_export_gltf_string_categories(tmpdir):
+    filename = str(tmpdir.mkdir('tmpdir').join('string_categories.gltf'))
+    mesh = pv.Plane(i_resolution=2, j_resolution=2)
+    labels = np.array(['a', 'b', 'a', 'b', 'a', 'b', 'a', 'b', 'a'], dtype=object)
+    mesh.point_data['category'] = labels
+
+    pl = pv.Plotter()
+    actor = pl.add_mesh(mesh, scalars='category', cmap='bwr', show_scalar_bar=False)
+    # add_mesh digitizes the string array; the mapper renders numeric codes
+    assert actor.mapper.GetArrayName() == 'category-digitized'
+    expected = _gltf_lut_rgba(actor.mapper, actor.mapper.dataset, 'category-digitized', point=True)
+    pl.export_gltf(filename)
+    pl.close()
+
+    colors, _ = _gltf_color_0(filename)
+    np.testing.assert_array_equal(colors, expected)
+    # only the two category colors survive, no garbage bytes
+    assert np.unique(colors[:, :3], axis=0).shape[0] == 2
+
+
+@pytest.mark.usefixtures('no_images_to_verify')
+def test_export_gltf_volume_does_not_raise(tmpdir):
+    filename = str(tmpdir.mkdir('tmpdir').join('volume.gltf'))
+    grid = pv.ImageData(dimensions=(4, 4, 4))
+    grid.point_data['scalars'] = np.arange(grid.n_points, dtype=float)
+
+    pl = pv.Plotter()
+    pl.add_volume(grid, scalars='scalars', show_scalar_bar=False)
+    # volume mappers have no scalar-visibility state and must skip color baking
+    pl.export_gltf(filename)
+    pl.close()
 
 
 def test_import_vrml():

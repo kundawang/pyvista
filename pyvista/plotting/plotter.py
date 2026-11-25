@@ -242,6 +242,161 @@ def _set_distortion_state(prop: _vtk.vtkProp, state: _DistortionState | None) ->
     prop._camera_distortion_state = state  # type: ignore[attr-defined]
 
 
+_GLTF_COLOR_ARRAY_PREFIX = '_PyVistaGLTFColor'
+
+
+@contextlib.contextmanager
+def _gltf_baked_colors(renderer: Renderer) -> Iterator[None]:
+    """Bake lookup-table colors into direct RGBA scalars for glTF export.
+
+    The glTF exporter cannot reproduce VTK's scalar-to-lookup-table mapping and
+    writes an invalid image in place of the color texture. Map the scalars
+    through each mapper's lookup table and expose the result as direct RGBA
+    scalars, which the exporter writes to the standard ``COLOR_0`` attribute.
+    Each mapper is temporarily pointed at a self-contained dataset; its input
+    connection, scalar configuration, and the original datasets are restored
+    on exit.
+    """
+    states: list[dict[str, Any]] = []
+    try:
+        for actor in renderer.actors.values():
+            mapper = actor.GetMapper() if hasattr(actor, 'GetMapper') else None
+            if mapper is None or not hasattr(mapper, 'GetScalarVisibility'):
+                continue
+            if not mapper.GetScalarVisibility():
+                continue
+            dataset = mapper.dataset
+            if dataset is None or mapper.GetColorModeAsString() != 'MapScalars':
+                continue
+            lut = mapper.GetLookupTable()
+            if lut is None:
+                continue
+            is_point = mapper.GetScalarModeAsString() == 'UsePointData'
+            array_name = mapper.GetArrayName()
+            # Build the dataset the exporter will render first, then map the
+            # colors from the scalars it carries. Surface extraction changes
+            # the number of points, so colors cannot be mapped on the original
+            # dataset.
+            polydata = _gltf_export_polydata(dataset)
+            data_attr = polydata.GetPointData() if is_point else polydata.GetCellData()
+            scalars = data_attr.GetArray(array_name) if array_name else data_attr.GetScalars()
+            if scalars is None:
+                continue
+            # MapScalars only handles numeric arrays; a vtkStringArray would
+            # return reinterpreted string bytes instead of colors. PyVista
+            # digitizes string scalars in add_mesh, so leave any non-numeric
+            # array to the exporter rather than baking invalid colors.
+            if not isinstance(scalars, _vtk.vtkDataArray):
+                continue
+            # A unique name avoids removing a user array that happens to share
+            # the temporary array's name during cleanup.
+            color_array_name = f'{_GLTF_COLOR_ARRAY_PREFIX}_{uuid.uuid4().hex}'
+            rgba = lut.MapScalars(scalars, 0, 0)
+            rgba.SetName(color_array_name)
+            if is_point:
+                export_dataset = _gltf_point_color_dataset(polydata, rgba)
+            else:
+                export_dataset = _gltf_split_cell_colors(polydata, rgba, color_array_name)
+            # Retain the input algorithm itself: the vtkAlgorithmOutput port
+            # returned by GetInputConnection is a temporary object and goes
+            # stale before the mapper can reconnect to it.
+            input_algorithm = mapper._active_scalars_algo
+            state: dict[str, Any] = {
+                'mapper': mapper,
+                'dataset': dataset,
+                'input_algorithm': input_algorithm,
+                'color_mode': mapper.GetColorMode(),
+                'scalar_mode': mapper.GetScalarMode(),
+                'array_name': array_name,
+                'array_id': mapper.GetArrayId(),
+                'field': data_attr,
+                'color_array_name': color_array_name,
+            }
+            mapper.SetInputData(export_dataset)
+            mapper.SetScalarModeToUsePointFieldData()
+            mapper.SetColorModeToDirectScalars()
+            mapper.SelectColorArray(color_array_name)
+            states.append(state)
+        yield
+    finally:
+        for state in reversed(states):
+            mapper = state['mapper']
+            if state['input_algorithm'] is not None:
+                set_algorithm_input(mapper, state['input_algorithm'])
+            else:
+                mapper.SetInputData(state['dataset'])
+            mapper.SetColorMode(state['color_mode'])
+            mapper.SetScalarMode(state['scalar_mode'])
+            if state['array_name']:
+                mapper.SelectColorArray(state['array_name'])
+            else:
+                mapper.SetArrayId(state['array_id'])
+            state['field'].RemoveArray(state['color_array_name'])
+            mapper.Update()
+
+
+def _gltf_export_polydata(dataset: DataSet) -> pv.PolyData:
+    """Return the PolyData representation used by the glTF exporter."""
+    if isinstance(dataset, pv.PolyData):
+        return dataset
+    return dataset.extract_surface(algorithm=None, pass_pointid=False, pass_cellid=False)
+
+
+def _gltf_point_color_dataset(
+    polydata: pv.PolyData, rgba: _vtk.vtkUnsignedCharArray
+) -> pv.PolyData:
+    """Return a shallow PolyData copy carrying direct RGBA point colors."""
+    output = polydata.copy(deep=False)
+    output.GetPointData().AddArray(rgba)
+    return output
+
+
+def _gltf_split_cell_colors(
+    polydata: pv.PolyData, rgba: _vtk.vtkUnsignedCharArray, color_array_name: str
+) -> pv.PolyData:
+    """Duplicate points so per-cell RGBA colors become per-point colors.
+
+    glTF has no cell-color attribute, and points shared between differently
+    colored cells cannot carry a single color. Each cell gets its own copy of
+    its corner points.
+    """
+    faces = polydata.faces
+    face_sizes: list[int] = []
+    face_ids: list[np.ndarray] = []
+    index = 0
+    while index < faces.size:
+        size = int(faces[index])
+        face_sizes.append(size)
+        face_ids.append(faces[index + 1 : index + 1 + size])
+        index += size + 1
+    point_ids = np.concatenate(face_ids)
+    cell_colors = pv.pyvista_ndarray(rgba)
+    point_colors = np.concatenate(
+        [np.repeat(cell_colors[i : i + 1], face_sizes[i], axis=0) for i in range(len(face_sizes))]
+    )
+    output = pv.PolyData()
+    output.points = polydata.points[point_ids]
+    new_faces = np.empty(len(face_sizes) + point_ids.size, dtype=np.int64)
+    cursor = 0
+    point_index = 0
+    for size in face_sizes:
+        new_faces[cursor] = size
+        new_faces[cursor + 1 : cursor + 1 + size] = np.arange(point_index, point_index + size)
+        point_index += size
+        cursor += size + 1
+    output.faces = new_faces
+    output.point_data[color_array_name] = point_colors
+    # The export loop renames 'Normals' to 'NORMAL' before baking; accept
+    # either name and always write 'NORMAL', the name the exporter recognizes.
+    normals = polydata.point_data.get('NORMAL', polydata.point_data.get('Normals'))
+    if normals is not None:
+        output.point_data['NORMAL'] = normals[point_ids]
+    tcoords = polydata.point_data.get('Texture Coordinates')
+    if tcoords is not None:
+        output.point_data['Texture Coordinates'] = tcoords[point_ids]
+    return output
+
+
 def close_all() -> bool:
     """Close all open/active plotters and clean up memory.
 
@@ -1107,6 +1262,12 @@ class BasePlotter(_BoundsSizeMixin):
         the plotter contains any non-PolyData datasets, these will be converted
         in the plotter, leading to a copy of the data internally.
 
+        Scalars colored through a lookup table are mapped to RGBA values and
+        exported as the glTF ``COLOR_0`` vertex attribute; the original scalar
+        values are not written. Cell scalars duplicate shared points so each
+        face keeps its own color. Meshes without scalars are exported without
+        a color attribute.
+
         Examples
         --------
         Output a simple point cloud represented as balls.
@@ -1186,12 +1347,16 @@ class BasePlotter(_BoundsSizeMixin):
                         except Exception as e:  # noqa: BLE001  # pragma: no cover
                             log.debug('Failed to rename array during gLTF export: %s', e)
 
-        exporter = _vtk.vtkGLTFExporter()
-        exporter.SetRenderWindow(self.render_window)
-        exporter.SetFileName(filename)
-        exporter.SetInlineData(inline_data)
-        exporter.SetSaveNormal(save_normals)
-        exporter.Update()
+        with contextlib.ExitStack() as stack:
+            for renderer in self.renderers:
+                stack.enter_context(_gltf_baked_colors(renderer))
+
+            exporter = _vtk.vtkGLTFExporter()
+            exporter.SetRenderWindow(self.render_window)
+            exporter.SetFileName(filename)
+            exporter.SetInlineData(inline_data)
+            exporter.SetSaveNormal(save_normals)
+            exporter.Update()
 
         # rotate back if applicable
         if rotate_scene:

@@ -537,3 +537,68 @@ def sample_function(
 
     _update_alg(samp, progress_bar=progress_bar, message='Sampling')
     return cast('ImageData', wrap(samp.GetOutput()))
+
+
+def voxelize_labels(
+    dataset: DataSet | MultiBlock | Sequence[DataSet], *args: Any, **kwargs: Any
+) -> ImageData:
+    """Voxelize blocks into one image with an integer label per block.
+
+    This is a convenience wrapper around
+    :meth:`pyvista.MultiBlock.voxelize_labels`. Pass a
+    :class:`~pyvista.MultiBlock` to label each block on one shared grid. A
+    single :class:`~pyvista.DataSet` is voxelized as a binary mask whose
+    foreground is labelled ``1``.
+
+    Parameters
+    ----------
+    dataset : DataSet | MultiBlock | Sequence[DataSet]
+        Closed surface mesh, composite of closed surface meshes, or a sequence
+        of closed surface meshes to voxelize.
+
+    *args : Any
+        Positional arguments forwarded to
+        :meth:`pyvista.MultiBlock.voxelize_labels` or
+        :meth:`pyvista.DataSetFilters.voxelize_binary_mask`.
+
+    **kwargs : Any
+        Keyword arguments forwarded to the underlying filter.
+
+    Returns
+    -------
+    ImageData
+        Labeled image. Background is ``0`` and each block has a nonzero label.
+
+    See Also
+    --------
+    pyvista.MultiBlock.voxelize_labels
+        Full multi-block filter with overlap and geometry options.
+
+    Examples
+    --------
+    >>> import pyvista as pv
+    >>> blocks = pv.MultiBlock([pv.Box(), pv.Box(bounds=(1, 2, 0, 1, 0, 1))])
+    >>> labels = pv.voxelize_labels(blocks, dimensions=(5, 3, 3))
+    >>> 'labels' in labels.point_data
+    True
+
+    """
+    if isinstance(dataset, pv.MultiBlock):
+        return dataset.voxelize_labels(*args, **kwargs)
+    if isinstance(dataset, Sequence) and not isinstance(dataset, (str, bytes)):
+        dataset = pv.MultiBlock(list(dataset))
+    elif isinstance(dataset, pv.DataSet):
+        # A single mesh is a one-block collection, so every geometry, name and
+        # overlap keyword behaves identically to the MultiBlock entry point.
+        dataset = pv.MultiBlock([dataset])
+    else:
+        msg = (
+            '`voxelize_labels` expects a pyvista MultiBlock, DataSet, or a sequence '
+            f'of DataSets, got {type(dataset).__name__} instead.'
+        )
+        raise TypeError(msg)
+    return dataset.voxelize_labels(*args, **kwargs)
+
+
+# Alternative spelling of the same utility.
+voxelize_labeled = voxelize_labels

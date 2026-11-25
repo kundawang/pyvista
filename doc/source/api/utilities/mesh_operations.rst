@@ -21,6 +21,8 @@ datasets.
    make_tri_mesh
    merge
    vector_poly_data
+   voxelize_labeled
+   voxelize_labels
 
 .. seealso::
 

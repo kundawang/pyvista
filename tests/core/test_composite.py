@@ -1820,3 +1820,246 @@ def test_is_homogeneous_is_heterogeneous(multiblock_all_with_nested_and_none):
     homogeneous = multiblock_all_with_nested_and_none.as_polydata_blocks()
     assert homogeneous.is_homogeneous is True
     assert homogeneous.is_heterogeneous is False
+
+
+def _label_acceptance_blocks():
+    # A and B are disjoint; C spans the gap and overlaps A on [1, 2] and B on
+    # [4, 5]. All three span y, z in [0, 2].
+    bounds_a = (0, 2, 0, 2, 0, 2)
+    bounds_b = (4, 6, 0, 2, 0, 2)
+    bounds_c = (1, 5, 0, 2, 0, 2)
+    return MultiBlock([pv.Box(bounds=bounds_a), pv.Box(bounds=bounds_b), pv.Box(bounds=bounds_c)])
+
+
+def _label_reference_volume():
+    # Sample points sit at x = 0.5, 1.5, ..., 6.5 and y, z = 0.5, 1.5. Every
+    # sample is strictly inside or outside a cube, never on a face.
+    return ImageData(dimensions=(7, 2, 2), spacing=(1.0, 1.0, 1.0), origin=(0.5, 0.5, 0.5))
+
+
+@pytest.mark.parametrize(
+    ('overlap', 'expected_line'),
+    [
+        ('last', [1, 3, 3, 3, 3, 2, 0]),
+        ('first', [1, 1, 3, 3, 2, 2, 0]),
+        ('zero', [1, 0, 3, 3, 0, 2, 0]),
+    ],
+)
+def test_voxelize_labels_coordinate_acceptance(overlap, expected_line):
+    blocks = _label_acceptance_blocks()
+    reference = _label_reference_volume()
+    labels = blocks.voxelize_labels(overlap=overlap, reference_volume=reference)
+
+    assert isinstance(labels, ImageData)
+    assert labels.dimensions == (7, 2, 2)
+    assert labels.spacing == (1.0, 1.0, 1.0)
+    assert labels.origin == (0.5, 0.5, 0.5)
+
+    array = labels['labels']
+    assert array.shape == (28,)
+    # The x label line is identical for every y, z sample.
+    expected = np.broadcast_to(np.asarray(expected_line), (2, 2, 7))
+    np.testing.assert_array_equal(array.reshape(2, 2, 7), expected)
+    assert set(np.unique(array).tolist()) <= {0, 1, 2, 3}
+    # The conventional binary-mask key carries the same labels.
+    np.testing.assert_array_equal(labels['mask'], array)
+
+
+def test_voxelize_labels_default_overlap_is_last():
+    blocks = _label_acceptance_blocks()
+    default = blocks.voxelize_labels(reference_volume=_label_reference_volume())
+    explicit = blocks.voxelize_labels(overlap='last', reference_volume=_label_reference_volume())
+    np.testing.assert_array_equal(default['labels'], explicit['labels'])
+
+
+def test_voxelize_labels_are_deterministic():
+    blocks = _label_acceptance_blocks()
+    reference = _label_reference_volume()
+    first = blocks.voxelize_labels(reference_volume=reference)['labels']
+    second = blocks.voxelize_labels(reference_volume=reference)['labels']
+    np.testing.assert_array_equal(first, second)
+
+
+def test_voxelize_labels_input_order_relabels_predictably():
+    reference = _label_reference_volume()
+    a, b, c = list(_label_acceptance_blocks())
+    reordered = MultiBlock([c, b, a])
+
+    last = reordered.voxelize_labels(reference_volume=reference)['labels']
+    assert last.reshape(2, 2, 7)[0, 0].tolist() == [3, 3, 1, 1, 2, 2, 0]
+
+    first = reordered.voxelize_labels(overlap='first', reference_volume=reference)['labels']
+    assert first.reshape(2, 2, 7)[0, 0].tolist() == [3, 1, 1, 1, 1, 2, 0]
+
+
+def test_voxelize_labels_empty_and_nested_blocks_keep_stable_indices():
+    a, b, c = list(_label_acceptance_blocks())
+    # Leaf slots in depth-first order: A=1, None=2, empty=3, B=4, C=5.
+    blocks = MultiBlock([a, None, PolyData(), MultiBlock([b, c])])
+    labels = blocks.voxelize_labels(reference_volume=_label_reference_volume())['labels']
+    assert labels.reshape(2, 2, 7)[0, 0].tolist() == [1, 5, 5, 5, 5, 4, 0]
+    # The reserved labels 2 and 3 never appear in the volume.
+    assert set(np.unique(labels).tolist()) == {0, 1, 4, 5}
+
+
+def test_voxelize_labels_all_empty_with_reference_returns_background():
+    reference = _label_reference_volume()
+    blocks = MultiBlock([None, PolyData(), MultiBlock([None])])
+    labels = blocks.voxelize_labels(reference_volume=reference)
+    assert labels.n_points == reference.n_points
+    assert np.all(labels['labels'] == 0)
+
+
+def test_voxelize_labels_all_empty_without_geometry_raises():
+    with pytest.raises(ValueError, match='no non-empty blocks'):
+        MultiBlock([None, PolyData()]).voxelize_labels(spacing=1.0)
+
+
+def test_voxelize_labels_unified_geometry_from_union_bounds():
+    blocks = MultiBlock([pv.Cube(center=(0, 0, 0)), pv.Cube(center=(4, 0, 0))])
+    labels = blocks.voxelize_labels(spacing=1.0)
+    # Both cubes share one inset grid derived from their combined bounds
+    # [-0.5, 4.5], so sample points run from 0 to 4 at unit spacing.
+    assert labels.origin == (0.0, 0.0, 0.0)
+    assert labels.dimensions[0] == 5
+    assert np.allclose(labels.spacing, 1.0)
+    assert set(np.unique(labels['labels']).tolist()) == {0, 1, 2}
+
+
+def test_voxelize_labels_dimensions_are_shared():
+    blocks = _label_acceptance_blocks()
+    labels = blocks.voxelize_labels(dimensions=(9, 3, 3))
+    assert labels.dimensions == (9, 3, 3)
+    assert labels['labels'].size == 9 * 3 * 3
+    # The three cubes cover the whole union interval, so every point is labeled.
+    assert set(np.unique(labels['labels']).tolist()) == {1, 2, 3}
+
+
+def test_voxelize_labels_accept_exact_dimensions_spacing_and_origin():
+    blocks = _label_acceptance_blocks()
+    labels = blocks.voxelize_labels(dimensions=(7, 2, 2), spacing=1.0, origin=0.5, overlap='last')
+    assert labels.dimensions == (7, 2, 2)
+    assert np.allclose(labels.spacing, 1.0)
+    assert np.allclose(labels.origin, 0.5)
+    expected = np.broadcast_to(np.asarray([1, 3, 3, 3, 3, 2, 0]), (2, 2, 7))
+    np.testing.assert_array_equal(labels['labels'].reshape(2, 2, 7), expected)
+
+
+@pytest.mark.parametrize('overlap_kwarg', ['on_overlap', 'overlap_rule', 'priority'])
+def test_voxelize_labels_overlap_kwarg_aliases(overlap_kwarg):
+    blocks = _label_acceptance_blocks()
+    labels = blocks.voxelize_labels(
+        **{overlap_kwarg: 'first'}, reference_volume=_label_reference_volume()
+    )
+    assert labels['labels'].reshape(2, 2, 7)[0, 0].tolist() == [1, 1, 3, 3, 2, 2, 0]
+
+
+def test_voxelize_labels_mixed_block_types():
+    blocks = MultiBlock(
+        [
+            pv.Sphere(radius=0.6),
+            pv.Cube(center=(2.5, 0, 0)).cast_to_unstructured_grid(),
+        ]
+    )
+    labels = blocks.voxelize_labels(spacing=0.25)
+    assert set(np.unique(labels['labels']).tolist()) == {0, 1, 2}
+
+
+def test_multiblock_voxelize_returns_labeled_cells():
+    blocks = _label_acceptance_blocks()
+    voxels = blocks.voxelize(reference_volume=_label_reference_volume())
+    assert isinstance(voxels, pv.UnstructuredGrid)
+    assert 'labels' in voxels.cell_data
+    assert voxels.n_cells > 0
+    assert set(np.unique(voxels.cell_data['labels']).tolist()) <= {1, 2, 3}
+
+
+def test_voxelize_labels_different_sized_meshes():
+    small = pv.Sphere(radius=0.5, center=(0, 0, 0))
+    big = pv.Box(bounds=(3, 7, -2, 2, -2, 2))
+    blocks = MultiBlock([small, big])
+    labels = blocks.voxelize_labels(spacing=0.5)
+    values = set(np.unique(labels['labels']).tolist())
+    assert values == {0, 1, 2}
+    # Each part owns a nonzero region of the shared grid.
+    assert np.count_nonzero(labels['labels'] == 1) > 0
+    assert np.count_nonzero(labels['labels'] == 2) > 0
+
+
+def test_voxelize_labels_matches_single_mesh_mask():
+    reference = _label_reference_volume()
+    cube = _label_acceptance_blocks()[0]
+    labeled = MultiBlock([cube]).voxelize_labels(reference_volume=reference)['labels']
+    binary = cube.voxelize_binary_mask(reference_volume=reference)['mask']
+    np.testing.assert_array_equal(labeled == 1, binary != 0)
+
+
+def test_multiblock_voxelize_binary_mask_is_union():
+    blocks = _label_acceptance_blocks()
+    mask = blocks.voxelize_binary_mask(reference_volume=_label_reference_volume())
+    assert mask.array_names == ['mask']
+    assert mask['mask'].reshape(2, 2, 7)[0, 0].tolist() == [1, 1, 1, 1, 1, 1, 0]
+
+    labeled = blocks.voxelize_binary_mask(labels=True, reference_volume=_label_reference_volume())
+    assert 'labels' in labeled.array_names
+
+
+def test_voxelize_labels_top_level_dispatch():
+    blocks = _label_acceptance_blocks()
+    reference = _label_reference_volume()
+    top_level = pv.voxelize_labels(blocks, reference_volume=reference)
+    method = blocks.voxelize_labels(reference_volume=reference)
+    np.testing.assert_array_equal(top_level['labels'], method['labels'])
+
+    single = pv.voxelize_labels(pv.Cube(), dimensions=(4, 4, 4))
+    assert set(np.unique(single['labels']).tolist()) <= {0, 1}
+
+    from_sequence = pv.voxelize_labels(
+        [pv.Box(bounds=(0, 1, 0, 1, 0, 1)), pv.Box(bounds=(3, 4, 0, 1, 0, 1))],
+        reference_volume=ImageData(
+            dimensions=(5, 2, 2), spacing=(1, 1, 1), origin=(0.5, 0.5, 0.5)
+        ),
+    )
+    assert set(np.unique(from_sequence['labels']).tolist()) == {0, 1, 2}
+
+    with pytest.raises(TypeError, match='expects a pyvista'):
+        pv.voxelize_labels(42)
+
+
+def test_voxelize_labels_rejects_unknown_overlap():
+    with pytest.raises(ValueError, match='`overlap`'):
+        _label_acceptance_blocks().voxelize_labels(
+            overlap='not-a-rule', reference_volume=_label_reference_volume()
+        )
+
+
+def test_voxelize_labels_custom_values_slot_or_dense():
+    a = pv.Box(bounds=(0, 2, 0, 2, 0, 2))
+    b = pv.Box(bounds=(4, 6, 0, 2, 0, 2))
+    reference = _label_reference_volume()
+    blocks = MultiBlock([a, None, b])
+
+    # One value per depth-first leaf slot (A=10, None=ignored, B=30).
+    slotted = blocks.voxelize_labels(labels=[10, 0, 30], reference_volume=reference)
+    line = slotted['labels'].reshape(2, 2, 7)[0, 0].tolist()
+    assert line == [10, 10, 0, 0, 30, 30, 0]
+
+    # Or one value per non-empty block, in traversal order, via singular `label`.
+    dense = blocks.voxelize_labels(label=[11, 22], reference_volume=reference)
+    dense_line = dense['labels'].reshape(2, 2, 7)[0, 0].tolist()
+    assert dense_line == [11, 11, 0, 0, 22, 22, 0]
+
+    with pytest.raises(ValueError, match='leaf slots'):
+        blocks.voxelize_labels(labels=[1], reference_volume=reference)
+
+
+def test_voxelize_labels_top_level_single_mesh_name_alias():
+    labeled = pv.voxelize_labels(pv.Cube(), dimensions=(4, 4, 4), labels_name='seg')
+    assert 'seg' in labeled.point_data
+    assert labeled.active_scalars_name == 'seg'
+    assert set(np.unique(labeled['seg']).tolist()) <= {0, 1}
+
+    custom = MultiBlock([pv.Box(), pv.Box(bounds=(1, 2, 0, 1, 0, 1))]).voxelize_binary_mask(
+        labels=[7, 9], dimensions=(5, 3, 3)
+    )
+    assert set(np.unique(custom['labels']).tolist()) <= {0, 7, 9}

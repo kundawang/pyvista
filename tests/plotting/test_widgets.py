@@ -212,6 +212,152 @@ def test_widget_plane(uniform):
     pl.close()
 
 
+@pytest.mark.parametrize('implicit', [True, False])
+@pytest.mark.parametrize('scale_first', [True, False])
+@pytest.mark.parametrize(
+    'scale',
+    [(1.0, 1.0, 1.0), (1.0, 1.0, 5.0), (2.0, 0.5, -1.0)],
+)
+def test_add_plane_widget_scaled_coordinates(scale, scale_first, implicit):
+    cube = pv.Cube(center=(0.0, 0.0, 0.5))
+    scale_array = np.array(scale)
+
+    pl = pv.Plotter()
+    pl.add_mesh(cube)
+    if scale_first:
+        pl.set_scale(*scale)
+
+    callback_origins = []
+    callback_normals = []
+
+    def callback(normal, origin):
+        callback_normals.append(np.array(normal))
+        callback_origins.append(np.array(origin))
+
+    widget = pl.add_plane_widget(
+        callback,
+        bounds=cube.bounds,
+        origin=cube.center,
+        assign_to_axis='z',
+        implicit=implicit,
+    )
+    if not scale_first:
+        pl.set_scale(*scale)
+
+    assert all(
+        prop.GetScale() == pytest.approx((1.0, 1.0, 1.0))
+        for prop in pl.widgets._plane_widget_props
+        if isinstance(prop, _vtk.vtkProp3D)
+    )
+
+    plane = _vtk.vtkPlane()
+    widget.GetPlane(plane)
+    assert plane.GetOrigin() == pytest.approx(np.array(cube.center) * scale_array)
+    assert plane.GetNormal() == pytest.approx((0.0, 0.0, np.sign(scale[2])))
+
+    for data_z in (0.0, 0.2, 1.0):
+        world_z = data_z * scale[2]
+        if implicit:
+            widget.SetOrigin(0.0, 0.0, world_z)
+        else:
+            widget.SetCenter(0.0, 0.0, world_z)
+        widget.InvokeEvent(_vtk.vtkCommand.EndInteractionEvent)
+
+        assert callback_origins[-1] == pytest.approx((0.0, 0.0, data_z), abs=1e-6)
+        assert callback_normals[-1] == pytest.approx((0.0, 0.0, 1.0), abs=1e-6)
+
+    pl.close()
+
+
+@pytest.mark.parametrize('implicit', [True, False])
+@pytest.mark.parametrize('scale_first', [True, False])
+def test_plane_widget_scale_change_preserves_off_axis_data_plane(scale_first, implicit):
+    scale = np.array((2.0, 0.5, -3.0))
+    data_normal = np.array((0.3, -0.4, 1.0))
+    data_normal /= np.linalg.norm(data_normal)
+    data_origin = np.array((0.1, -0.2, 0.3))
+
+    pl = pv.Plotter()
+    if scale_first:
+        pl.set_scale(*scale)
+
+    callback_values = []
+    widget = pl.add_plane_widget(
+        lambda normal, origin: callback_values.append((np.array(normal), np.array(origin))),
+        normal=tuple(data_normal),
+        origin=tuple(data_origin),
+        implicit=implicit,
+    )
+    if not scale_first:
+        pl.set_scale(*scale)
+
+    callback_normal, callback_origin = callback_values[-1]
+    assert callback_normal == pytest.approx(data_normal, abs=1e-6)
+    assert callback_origin == pytest.approx(data_origin, abs=1e-6)
+
+    expected_world_normal = data_normal / scale
+    expected_world_normal /= np.linalg.norm(expected_world_normal)
+    plane = _vtk.vtkPlane()
+    widget.GetPlane(plane)
+    assert plane.GetNormal() == pytest.approx(expected_world_normal, abs=1e-6)
+    assert plane.GetOrigin() == pytest.approx(data_origin * scale, abs=1e-6)
+    pl.close()
+
+
+def test_plane_widget_zero_scale_is_replaced():
+    pl = pv.Plotter()
+    pl.add_plane_widget(None)
+    pl.set_scale(zscale=0.0)
+    assert pl.scale == [1.0, 1.0, 1.0]
+    pl.close()
+
+
+@pytest.mark.parametrize('implicit', [True, False])
+@pytest.mark.parametrize('scale_first', [True, False])
+@pytest.mark.parametrize(
+    'scale',
+    [(1.0, 1.0, 5.0), (2.0, 3.0, 5.0), (2.0, 0.5, -1.0), (-2.0, 0.5, -3.0)],
+)
+def test_add_mesh_clip_plane_scaled_cube_matches_data_clip(scale, scale_first, implicit):
+    cube = pv.Cube(center=(0.0, 0.0, 0.5))
+    original_points = cube.points.copy()
+    scale_array = np.array(scale)
+
+    pl = pv.Plotter()
+    if scale_first:
+        pl.set_scale(*scale)
+    pl.add_mesh_clip_plane(
+        cube,
+        normal='z',
+        origin=(0.0, 0.0, 0.5),
+        implicit=implicit,
+    )
+    if not scale_first:
+        pl.set_scale(*scale)
+
+    widget = pl.widgets.plane_widgets[0]
+    world_origin = np.array((0.0, 0.0, 0.2 * scale[2]))
+    world_normal = np.array((0.0, 0.0, 1.0))
+    widget.SetNormal(*world_normal)
+    if implicit:
+        widget.SetOrigin(*world_origin)
+    else:
+        widget.SetCenter(*world_origin)
+    widget.InvokeEvent(_vtk.vtkCommand.EndInteractionEvent)
+
+    data_normal = scale_array * world_normal
+    data_normal /= np.linalg.norm(data_normal)
+    expected = cube.clip(
+        normal=data_normal,
+        origin=(0.0, 0.0, 0.2),
+        invert=False,
+    )
+    actual = pl.widgets.plane_clipped_meshes[0]
+    assert np.allclose(actual.bounds, expected.bounds, atol=1e-5)
+    assert np.array_equal(cube.points, original_points)
+    pl.close()
+
+
 def test_widget_line(uniform):
     pl = pv.Plotter()
     func = lambda line: line  # Does nothing
@@ -689,6 +835,17 @@ def test_add_volume_clip_plane(uniform):
     assert vol.mapper.GetClippingPlanes() is None
     pl.add_volume_clip_plane(vol)
     assert vol.mapper.GetClippingPlanes().GetNumberOfItems() == 1
+    pl.close()
+
+
+def test_add_volume_clip_plane_scale_updates_clipping_plane(uniform):
+    pl = pv.Plotter()
+    pl.add_volume_clip_plane(uniform, normal='z', origin=uniform.center)
+    pl.set_scale(zscale=5.0)
+
+    equation = [0.0] * 4
+    pl.volume.mapper.GetClippingPlaneInDataCoords(pl.volume.GetMatrix(), 0, equation)
+    assert -equation[3] / equation[2] == pytest.approx(uniform.center[2])
     pl.close()
 
 

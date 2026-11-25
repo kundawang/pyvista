@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from ._typing import ColorLike
     from .actor import Actor
     from .plotter import BasePlotter
+    from .renderer import Renderer
     from .text import Text
     from .volume import Volume
 
@@ -71,6 +72,42 @@ _SphereStyleOptions = Literal['surface', 'wireframe']
 def _float_list(values: VectorLikeFloat) -> list[float]:
     """Return the values as a plain list of floats."""
     return [float(value) for value in values]
+
+
+def _safe_scale(scale: VectorLikeFloat) -> NDArray[np.float64]:
+    """Return finite, nonzero scale factors safe for coordinate inversion."""
+    factors = np.asarray(scale, dtype=float).copy()
+    factors[~np.isfinite(factors) | (factors == 0.0)] = 1.0
+    return factors
+
+
+def _scale_bounds(
+    bounds: VectorLikeFloat, scale: VectorLikeFloat, *, invert: bool = False
+) -> list[float]:
+    """Scale axis-aligned bounds and preserve their min/max ordering."""
+    scale_factors = _safe_scale(scale)
+    if invert:
+        scale_factors = 1.0 / scale_factors
+    scaled_bounds = np.asarray(bounds, dtype=float).reshape(3, 2) * scale_factors[:, None]
+    ordered_bounds = np.column_stack(
+        (
+            np.minimum(scaled_bounds[:, 0], scaled_bounds[:, 1]),
+            np.maximum(scaled_bounds[:, 0], scaled_bounds[:, 1]),
+        )
+    )
+    return _float_list(ordered_bounds.ravel())
+
+
+def _transform_plane_normal(
+    normal: VectorLikeFloat, scale: VectorLikeFloat, *, to_world: bool
+) -> list[float]:
+    """Transform a plane normal between data and scaled world coordinates."""
+    factors = _safe_scale(scale)
+    if to_world:
+        factors = 1.0 / factors
+    transformed = np.asarray(normal, dtype=float) * factors
+    transformed /= np.linalg.norm(transformed)
+    return _float_list(transformed)
 
 
 def _parse_interaction_event(
@@ -195,6 +232,12 @@ class WidgetComponent(_NoNewAttrMixin):
         self.box_widgets: list[_vtk.vtkBoxWidget] = []
         self.box_clipped_meshes: list[DataSet] = []
         self.plane_widgets: list[_PlaneWidget] = []
+        self._plane_widget_bounds: dict[_PlaneWidget, tuple[float, ...]] = {}
+        self._plane_widget_renderers: dict[_PlaneWidget, Renderer] = {}
+        self._plane_widget_callbacks: dict[
+            _PlaneWidget, Callable[[_PlaneWidget, str | None], None]
+        ] = {}
+        self._plane_widget_props: set[_vtk.vtkProp] = set()
         self.plane_clipped_meshes: list[DataSet] = []
         self.plane_sliced_meshes: list[DataSet] = []
         self.line_widgets: list[_vtk.vtkLineWidget] = []
@@ -522,14 +565,22 @@ class WidgetComponent(_NoNewAttrMixin):
         This is useless without a callback function. You can pass a
         callable function that takes two arguments, the normal and
         origin of the plane in that order output from this widget, and
-        performs a task with that plane.
+        performs a task with that plane. Callback coordinates and the
+        ``normal``, ``origin``, and ``bounds`` arguments use unscaled
+        scene coordinates; the widget itself uses the renderer's scaled
+        world coordinates.
 
         Parameters
         ----------
         callback : callable
             The method called every time the plane is updated. Takes
             two arguments, the normal and origin of the plane in that
-            order.
+            order. The normal and origin are in unscaled scene
+            coordinates.
+
+            .. versionchanged:: 0.50
+                Coordinates are transformed from the renderer's scaled
+                world coordinates.
 
         normal : str | VectorLikeFloat
             The starting normal vector of the plane.
@@ -627,11 +678,47 @@ class WidgetComponent(_NoNewAttrMixin):
         >>> pl.show()
 
         """
-        widget_origin = _float_list(self._plotter.center if origin is None else origin)
-        widget_bounds = _float_list(self._plotter.bounds if bounds is None else bounds)
+        renderer = self._plotter.renderer
+        renderer_scale = _safe_scale(renderer.scale)
+        scale_is_identity = np.allclose(renderer_scale, np.ones(3))
+        existing_renderer_props = set(renderer.actors.values())
+
+        if origin is None:
+            if scale_is_identity:
+                widget_data_origin = _float_list(self._plotter.center)
+            else:
+                widget_data_origin = _float_list(
+                    np.asarray(self._plotter.center, dtype=float) / renderer_scale
+                )
+        else:
+            widget_data_origin = _float_list(origin)
+
+        if bounds is None:
+            if scale_is_identity:
+                widget_data_bounds = _float_list(self._plotter.bounds)
+            else:
+                widget_data_bounds = _scale_bounds(
+                    self._plotter.bounds, renderer_scale, invert=True
+                )
+        else:
+            widget_data_bounds = _float_list(bounds)
+
+        if scale_is_identity:
+            widget_origin = widget_data_origin
+            widget_bounds = widget_data_bounds
+        else:
+            widget_origin = _float_list(
+                np.asarray(widget_data_origin, dtype=float) * renderer_scale
+            )
+            widget_bounds = _scale_bounds(widget_data_bounds, renderer_scale)
 
         normal_vector = _float_list(
             _NORMALS[normal.lower()] if isinstance(normal, str) else normal
+        )
+        widget_normal = (
+            normal_vector
+            if scale_is_identity
+            else _transform_plane_normal(normal_vector, renderer_scale, to_world=True)
         )
 
         widget_color_ = Color(color, default_color=pv.global_theme.font.color)
@@ -642,13 +729,24 @@ class WidgetComponent(_NoNewAttrMixin):
         def _the_callback(widget: _PlaneWidget, _event: str | None) -> None:
             the_plane = _vtk.vtkPlane()
             widget.GetPlane(the_plane)
-            plane_normal = the_plane.GetNormal()
-            plane_origin = the_plane.GetOrigin()
+            callback_normal: VectorLikeFloat = the_plane.GetNormal()
+            callback_origin: VectorLikeFloat = the_plane.GetOrigin()
+
+            current_scale = _safe_scale(renderer.scale)
+            if not np.allclose(current_scale, np.ones(3)):
+                # VTK works in scaled world coordinates while filters use data coordinates.
+                callback_origin = _float_list(
+                    np.asarray(callback_origin, dtype=float) / current_scale
+                )
+                callback_normal = _transform_plane_normal(
+                    callback_normal, current_scale, to_world=False
+                )
+
             if callable(callback):
                 if pass_widget:
-                    try_callback(callback, plane_normal, plane_origin, widget)
+                    try_callback(callback, callback_normal, callback_origin, widget)
                 else:
-                    try_callback(callback, plane_normal, plane_origin)
+                    try_callback(callback, callback_normal, callback_origin)
 
         plane_widget: _PlaneWidget
         if implicit:
@@ -680,7 +778,7 @@ class WidgetComponent(_NoNewAttrMixin):
         else:
             # Position of the small plane
             source = _vtk.vtkPlaneSource()
-            source.SetNormal(*normal_vector)
+            source.SetNormal(*widget_normal)
             source.SetCenter(*widget_origin)
             source.SetPoint1(
                 widget_origin[0] + (widget_bounds[1] - widget_bounds[0]) * 0.01,
@@ -718,27 +816,42 @@ class WidgetComponent(_NoNewAttrMixin):
         if assign_to_axis:
             # Note that normal_rotation was forced to False
             if assign_to_axis in [0, 'x', 'X']:
+                axis_normal = _NORMALS['x']
                 plane_widget.NormalToXAxisOn()
-                plane_widget.SetNormal(*_NORMALS['x'])
             elif assign_to_axis in [1, 'y', 'Y']:
+                axis_normal = _NORMALS['y']
                 plane_widget.NormalToYAxisOn()
-                plane_widget.SetNormal(*_NORMALS['y'])
             elif assign_to_axis in [2, 'z', 'Z']:
+                axis_normal = _NORMALS['z']
                 plane_widget.NormalToZAxisOn()
-                plane_widget.SetNormal(*_NORMALS['z'])
             else:
                 msg = 'assign_to_axis not understood'
                 raise RuntimeError(msg)
+            plane_widget.SetNormal(
+                *(
+                    axis_normal
+                    if scale_is_identity
+                    else _transform_plane_normal(axis_normal, renderer_scale, to_world=True)
+                )
+            )
         else:
-            plane_widget.SetNormal(*normal_vector)
+            plane_widget.SetNormal(*widget_normal)
 
         plane_widget.Modified()
         plane_widget.UpdatePlacement()
         plane_widget.On()
-        plane_widget.AddObserver(
-            _parse_interaction_event(interaction_event),
-            _the_callback,
-        )
+
+        # The widget is placed directly in scaled world coordinates. Track its
+        # own props so set_scale() does not scale the representation a second time.
+        for prop in renderer.actors.values():
+            if prop not in existing_renderer_props:
+                self._plane_widget_props.add(prop)
+        self._plane_widget_bounds[plane_widget] = tuple(widget_data_bounds)
+        self._plane_widget_renderers[plane_widget] = renderer
+
+        interaction_event_id = _parse_interaction_event(interaction_event)
+        self._plane_widget_callbacks[plane_widget] = _the_callback
+        plane_widget.AddObserver(interaction_event_id, _the_callback)
         if test_callback:
             _the_callback(plane_widget, None)  # Trigger immediate update
 
@@ -750,6 +863,51 @@ class WidgetComponent(_NoNewAttrMixin):
         for plane_widget in self.plane_widgets:
             plane_widget.Off()
         self.plane_widgets.clear()
+        self._plane_widget_bounds.clear()
+        self._plane_widget_renderers.clear()
+        self._plane_widget_callbacks.clear()
+        self._plane_widget_props.clear()
+
+    def _sync_plane_widget_scale(
+        self,
+        old_scale: VectorLikeFloat,
+        new_scale: VectorLikeFloat,
+        renderer: Renderer,
+    ) -> None:
+        """Move plane widgets with a renderer's actor scale."""
+        old_scale_array = _safe_scale(old_scale)
+        new_scale_array = _safe_scale(new_scale)
+        if np.allclose(old_scale_array, new_scale_array):
+            return
+
+        for plane_widget in self.plane_widgets:
+            if self._plane_widget_renderers.get(plane_widget) is not renderer:
+                continue
+
+            current_plane = _vtk.vtkPlane()
+            plane_widget.GetPlane(current_plane)
+            data_origin = np.asarray(current_plane.GetOrigin(), dtype=float) / old_scale_array
+            data_normal = np.asarray(current_plane.GetNormal(), dtype=float) * old_scale_array
+            data_normal /= np.linalg.norm(data_normal)
+
+            data_bounds = self._plane_widget_bounds.get(plane_widget)
+            if data_bounds is not None:
+                plane_widget.PlaceWidget(_scale_bounds(data_bounds, new_scale_array))
+
+            world_origin = _float_list(data_origin * new_scale_array)
+            if isinstance(plane_widget, _vtk.vtkPlaneWidget):
+                plane_widget.SetCenter(*world_origin)
+            else:
+                plane_widget.SetOrigin(*world_origin)
+            plane_widget.SetNormal(
+                *_transform_plane_normal(data_normal, new_scale_array, to_world=True)
+            )
+
+            plane_widget.Modified()
+            plane_widget.UpdatePlacement()
+            update_callback = self._plane_widget_callbacks.get(plane_widget)
+            if update_callback is not None:
+                update_callback(plane_widget, None)
 
     def add_mesh_clip_plane(
         self,
@@ -1048,17 +1206,25 @@ class WidgetComponent(_NoNewAttrMixin):
             volume_actor = volume
 
         plane = _vtk.vtkPlane()
+        volume_scale = _safe_scale(self._plotter.renderer.scale)
+        volume_bounds = (
+            _scale_bounds(volume_actor.bounds, volume_scale, invert=True)
+            if not np.allclose(volume_scale, np.ones(3))
+            else volume_actor.bounds
+        )
 
         def callback(
-            plane_normal: VectorLikeFloat, plane_origin: VectorLikeFloat
+            _plane_normal: VectorLikeFloat,
+            _plane_origin: VectorLikeFloat,
+            plane_widget: _PlaneWidget,
         ) -> None:  # numpydoc ignore=PR01
             """Update the plane used to clip the volume."""
-            plane.SetNormal(*plane_normal)
-            plane.SetOrigin(*plane_origin)
+            plane_widget.GetPlane(plane)
 
         widget = self.add_plane_widget(
             callback=callback,
-            bounds=volume_actor.bounds,
+            pass_widget=True,
+            bounds=volume_bounds,
             factor=factor,
             normal=normal,
             color=widget_color,

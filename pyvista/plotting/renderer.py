@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from collections.abc import Iterable
 from collections.abc import Sequence
 import contextlib
@@ -3115,20 +3116,34 @@ class Renderer(_NoNewAttrMixin, _BoundsSizeMixin, DisableVtkSnakeCase, _vtk.vtkO
         >>> pl.show()
 
         """
+        old_scale = list(self.scale)
         if xscale is None:
             xscale = self.scale[0]
         if yscale is None:
             yscale = self.scale[1]
         if zscale is None:
             zscale = self.scale[2]
-        self.scale = [xscale, yscale, zscale]
+        new_scale = np.array([xscale, yscale, zscale], dtype=float)
+        new_scale[new_scale == 0.0] = 1.0
+        self.scale = new_scale.tolist()
+
+        widget_component = getattr(self._plotter, '__dict__', {}).get('widgets')
+        plane_widget_props: Collection[_vtk.vtkProp] = getattr(
+            widget_component, '_plane_widget_props', frozenset()
+        )
 
         # Reset all actors to match this scale
         for actor in self.actors.values():
+            if actor in plane_widget_props:
+                continue
             if isinstance(actor, _vtk.vtkAxisActor2D) and hasattr(actor, '_unscaled_points'):
                 self._place_ruler(actor)
             elif hasattr(actor, 'SetScale'):
                 actor.SetScale(self.scale)
+
+        sync_plane_widgets = getattr(widget_component, '_sync_plane_widget_scale', None)
+        if callable(sync_plane_widgets):
+            sync_plane_widgets(old_scale, self.scale, self)
 
         self._plotter.render()
         if reset_camera:

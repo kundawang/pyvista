@@ -1432,6 +1432,198 @@ class _PolyDataMapper(_BaseDataSetMapper, _vtk.vtkPolyDataMapper):
         super().__init__(dataset=dataset, theme=theme)
 
 
+_LICContrastOptions = Literal['off', 'lic', 'color', 'both']
+_LIC_ENHANCE_CONTRAST_MODES: dict[_LICContrastOptions, int] = {
+    'off': 0,  # vtkSurfaceLICInterface.ENHANCE_CONTRAST_OFF
+    'lic': 1,  # vtkSurfaceLICInterface.ENHANCE_CONTRAST_LIC
+    'color': 3,  # vtkSurfaceLICInterface.ENHANCE_CONTRAST_COLOR
+    'both': 4,  # vtkSurfaceLICInterface.ENHANCE_CONTRAST_BOTH
+}
+
+
+class SurfaceLICMapper(_BaseDataSetMapper, _vtk.vtkSurfaceLICMapper):
+    """Wrap :vtk:`vtkSurfaceLICMapper`.
+
+    Integrates a point-data vector field on the surface into line integral
+    convolution (LIC) streamlines that follow the surface curvature. Select
+    the integrated vector array with :meth:`set_vectors`. Scalar coloring
+    configured through :meth:`set_scalars` is blended with the LIC texture
+    when scalar visibility is enabled.
+
+    Parameters
+    ----------
+    dataset : pyvista.PolyData, optional
+        Dataset to assign to this mapper.
+
+    theme : pyvista.plotting.themes.Theme, optional
+        Plot-specific theme.
+
+    """
+
+    def __init__(
+        self,
+        dataset: DataSet | None = None,
+        theme: Theme | None = None,
+    ) -> None:
+        """Initialize this class."""
+        super().__init__(dataset=dataset, theme=theme)
+        # vtkSurfaceLICMapper defaults to the array named "Vectors"; clear the
+        # selection so an unset or missing array reports no vectors instead.
+        self.SetInputArrayToProcess(0, 0, 0, _vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, None)
+
+    @property
+    def lic_interface(self) -> _vtk.vtkSurfaceLICInterface:  # numpydoc ignore=RT01
+        """Return the wrapped :vtk:`vtkSurfaceLICInterface` driving the LIC."""
+        return self.GetLICInterface()
+
+    def set_vectors(self, name: str) -> None:
+        """Select the point-data vector array integrated by the LIC.
+
+        Parameters
+        ----------
+        name : str
+            Name of a three-component point-data array on the mapped dataset.
+
+        """
+        _validation.check_string(name, name='vectors')
+        dataset = self.dataset
+        if dataset is None or name not in dataset.point_data:
+            available = (
+                'none'
+                if dataset is None or not dataset.point_data
+                else ', '.join(dataset.point_data.keys())
+            )
+            msg = (
+                f'Point-data vector array {name!r} does not exist. '
+                f'Available point arrays are: {available}.'
+            )
+            raise KeyError(msg)
+        vectors = dataset.point_data[name]
+        if vectors.ndim != 2 or vectors.shape[1] != 3:
+            components = vectors.shape[1] if vectors.ndim == 2 else 1
+            msg = (
+                f'Array {name!r} has {components} components but Surface LIC '
+                'requires a three-component point vector array.'
+            )
+            raise ValueError(msg)
+        self.SetInputArrayToProcess(0, 0, 0, _vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, name)
+
+    @property
+    def lic_number_of_steps(self) -> int:  # numpydoc ignore=RT01
+        """Return or set the number of integration steps taken in each direction.
+
+        More steps produce longer streamlines. The VTK default is 20.
+        """
+        return self.lic_interface.GetNumberOfSteps()
+
+    @lic_number_of_steps.setter
+    def lic_number_of_steps(self, number_of_steps: int) -> None:
+        _validation.check_integer(number_of_steps, name='number_of_steps')
+        _validation.check_range(number_of_steps, rng=[1, float('inf')], name='number_of_steps')
+        self.lic_interface.SetNumberOfSteps(int(number_of_steps))
+
+    @property
+    def lic_step_size(self) -> float:  # numpydoc ignore=RT01
+        """Return or set the integration step size in world units.
+
+        The VTK default is 1.0.
+        """
+        return self.lic_interface.GetStepSize()
+
+    @lic_step_size.setter
+    def lic_step_size(self, step_size: float) -> None:
+        _validation.check_number(step_size, name='step_size')
+        _validation.check_nonnegative(step_size, name='step_size')
+        self.lic_interface.SetStepSize(float(step_size))
+
+    @property
+    def lic_enhance_contrast(self) -> _LICContrastOptions:  # numpydoc ignore=RT01
+        """Return or set which LIC outputs receive contrast enhancement.
+
+        One of ``'off'``, ``'lic'``, ``'color'``, or ``'both'``. Enhancement
+        factors are set with :attr:`lic_contrast_enhancement_factor`.
+        """
+        value = self.lic_interface.GetEnhanceContrast()
+        modes = {v: k for k, v in _LIC_ENHANCE_CONTRAST_MODES.items()}
+        return modes[value]
+
+    @lic_enhance_contrast.setter
+    def lic_enhance_contrast(self, mode: _LICContrastOptions) -> None:
+        _validation.check_contains(
+            list(get_args(_LICContrastOptions)),
+            must_contain=mode,
+            name='lic_enhance_contrast',
+        )
+        self.lic_interface.SetEnhanceContrast(_LIC_ENHANCE_CONTRAST_MODES[mode])
+
+    @property
+    def lic_contrast_enhancement_factor(self) -> tuple[float, float]:  # numpydoc ignore=RT01
+        """Return or set the low and high LIC contrast enhancement factors.
+
+        Each factor is in the range ``[0.0, 1.0]``; VTK clamps larger values.
+        """
+        iface = self.lic_interface
+        return (
+            iface.GetLowLICContrastEnhancementFactor(),
+            iface.GetHighLICContrastEnhancementFactor(),
+        )
+
+    @lic_contrast_enhancement_factor.setter
+    def lic_contrast_enhancement_factor(self, factor: VectorLikeFloat) -> None:
+        _validation.check_length(factor, exact_length=2, name='lic_contrast_enhancement_factor')
+        low, high = (float(value) for value in factor)
+        for value, value_name in ((low, 'low'), (high, 'high')):
+            _validation.check_range(value, rng=[0.0, 1.0], name=f'{value_name} factor')
+        iface = self.lic_interface
+        iface.SetLowLICContrastEnhancementFactor(low)
+        iface.SetHighLICContrastEnhancementFactor(high)
+
+    @property
+    def lic_intensity(self) -> float:  # numpydoc ignore=RT01
+        """Return or set the fraction of LIC texture blended into the surface color.
+
+        Ranges from ``0.0`` (no LIC) to ``1.0``. The VTK default is 0.8.
+        """
+        return self.lic_interface.GetLICIntensity()
+
+    @lic_intensity.setter
+    def lic_intensity(self, intensity: float) -> None:
+        _validation.check_range(intensity, rng=[0.0, 1.0], name='lic_intensity')
+        self.lic_interface.SetLICIntensity(float(intensity))
+
+    @property
+    def lic_normalize_vectors(self) -> bool:  # numpydoc ignore=RT01
+        """Return or set whether vectors are normalized before integration.
+
+        When enabled (the VTK default), streamline spacing is independent of
+        vector magnitude; when disabled, magnitude affects integration speed.
+        """
+        return bool(self.lic_interface.GetNormalizeVectors())
+
+    @lic_normalize_vectors.setter
+    def lic_normalize_vectors(self, normalize: bool) -> None:
+        self.lic_interface.SetNormalizeVectors(bool(normalize))
+
+    def can_render_lic(self, actor: _vtk.vtkActor) -> bool:
+        """Return whether the LIC path can render for an actor on this window.
+
+        Reports whether a vector array has been selected and the OpenGL
+        context provides the extensions the LIC mapper requires.
+
+        Parameters
+        ----------
+        actor : :vtk:`vtkActor`
+            Actor whose mapper is this LIC mapper.
+
+        Returns
+        -------
+        bool
+            ``True`` when the mapper can render the surface LIC.
+
+        """
+        return bool(self.lic_interface.CanRenderSurfaceLIC(actor))
+
+
 class PointGaussianMapper(_BaseDataSetMapper, _vtk.vtkPointGaussianMapper):
     """Wrap :vtk:`vtkPointGaussianMapper`.
 

@@ -78,6 +78,7 @@ from .mapper import GPUVolumeRayCastMapper
 from .mapper import OpenGLGPUVolumeRayCastMapper
 from .mapper import PointGaussianMapper
 from .mapper import SmartVolumeMapper
+from .mapper import SurfaceLICMapper
 from .mapper import UnstructuredGridVolumeRayCastMapper
 from .mapper import _apply_categories
 from .mapper import _BaseMapper
@@ -3692,6 +3693,7 @@ class BasePlotter(_BoundsSizeMixin):
         edge_opacity: float | None = None,
         remove_existing_actor: bool | None = None,
         force_opaque: bool = False,
+        _mapper: _BaseMapper | None = None,
         **kwargs,
     ) -> Actor:
         """Add any PyVista/VTK mesh or dataset that PyVista can wrap to the scene.
@@ -4408,6 +4410,8 @@ class BasePlotter(_BoundsSizeMixin):
             mapper = _PolyDataMapper(theme=self.theme)
         else:
             mapper = DataSetMapper(theme=self.theme)
+        if _mapper is not None:
+            mapper = _mapper
         self.mapper = mapper
 
         # Parse arguments
@@ -4792,6 +4796,200 @@ class BasePlotter(_BoundsSizeMixin):
 
         self.renderer.Modified()
 
+        return actor
+
+    def add_surface_lic(
+        self,
+        mesh: pv.PolyData,
+        *,
+        vectors: str | None = None,
+        number_of_steps: int = 20,
+        step_size: float = 1.0,
+        enhance_contrast: str = 'off',
+        contrast_enhancement_factor: Sequence[float] | None = None,
+        lic_intensity: float = 0.8,
+        normalize_vectors: bool = True,
+        scalars: str | NDArray[Any] | None = None,
+        color: ColorLike | None = None,
+        cmap: ColormapOptions | LookupTable | None = None,
+        clim: Sequence[float] | None = None,
+        opacity: float | None = None,
+        show_scalar_bar: bool | None = None,
+        scalar_bar_args: ScalarBarArgs | None = None,
+        name: str | None = None,
+        render: bool = True,
+        **kwargs: Any,
+    ) -> Actor:
+        """Add a surface line integral convolution (LIC) of a vector field.
+
+        Integrates a point-data vector field along the surface into dense
+        streamlines that follow the surface curvature. Scalar coloring is
+        supported through ``scalars`` and blended with the LIC texture;
+        without scalars, the surface is drawn in ``color`` (or the theme
+        default) with the LIC overlaid.
+
+        Surface LIC requires VTK's ``vtkRenderingLICOpenGL2`` module and an
+        OpenGL context that supports it. Use
+        :meth:`SurfaceLICMapper.can_render_lic` to confirm the render path is
+        available after the first render.
+
+        Parameters
+        ----------
+        mesh : pyvista.PolyData
+            Surface mesh with a three-component point-data vector array and at
+            least one face.
+
+        vectors : str, optional
+            Name of the point-data vector array to integrate. Defaults to the
+            mesh's active vectors.
+
+        number_of_steps : int, default: 20
+            Number of integration steps taken in each direction. More steps
+            produce longer streamlines. Must be positive.
+
+        step_size : float, default: 1.0
+            Integration step size in world units.
+
+        enhance_contrast : str, default: ``'off'``
+            Which outputs receive contrast enhancement. One of ``'off'``,
+            ``'lic'``, ``'color'``, or ``'both'``.
+
+        contrast_enhancement_factor : sequence[float], optional
+            Length-two sequence of low and high LIC contrast enhancement
+            factors, each in the range ``[0.0, 1.0]``. Defaults to VTK's
+            low and high factors.
+
+        lic_intensity : float, default: 0.8
+            Fraction of the LIC texture blended into the surface color, in
+            the range ``[0.0, 1.0]``.
+
+        normalize_vectors : bool, default: True
+            Normalize vectors before integration so streamline spacing is
+            independent of vector magnitude.
+
+        scalars : str | numpy.ndarray, optional
+            Scalars used to color the surface, blended with the LIC texture.
+            Accepts an array name present on the mesh or a scalar array.
+
+        color : ColorLike, optional
+            Solid surface color used when ``scalars`` is not given. Defaults
+            to the global theme color.
+
+        cmap : str | list | pyvista.LookupTable, optional
+            Colormap used when ``scalars`` is given.
+
+        clim : sequence[float], optional
+            Two-item color bar range for the scalars.
+
+        opacity : float | sequence, optional
+            Opacity of the surface in the range ``[0.0, 1.0]``.
+
+        show_scalar_bar : bool, optional
+            Whether to show the scalar bar when ``scalars`` is given.
+
+        scalar_bar_args : dict, optional
+            Keyword arguments passed to :meth:`add_scalar_bar`.
+
+        name : str, optional
+            Name to assign to the actor.
+
+        render : bool, default: True
+            Render the scene after adding the actor.
+
+        **kwargs : dict, optional
+            Additional keyword arguments accepted by :meth:`add_mesh`.
+
+        Returns
+        -------
+        pyvista.Actor
+            Actor whose mapper is a :class:`pyvista.SurfaceLICMapper`.
+
+        Examples
+        --------
+        Add a surface LIC of a rotating vector field on a plane.
+
+        >>> import numpy as np
+        >>> import pyvista as pv
+        >>> mesh = pv.Plane(i_resolution=40, j_resolution=40)
+        >>> mesh['vectors'] = np.column_stack(
+        ...     [
+        ...         np.cos(mesh.points[:, 0] * 6),
+        ...         np.sin(mesh.points[:, 0] * 6),
+        ...         np.zeros(mesh.n_points),
+        ...     ]
+        ... )
+        >>> pl = pv.Plotter()
+        >>> actor = pl.add_surface_lic(mesh, vectors='vectors', render=False)
+        >>> pl.close()
+
+        """
+        if not _vtk.has_attr('vtkSurfaceLICMapper'):
+            msg = (
+                'Surface LIC requires the VTK RenderingLICOpenGL2 module, '
+                'which is not available in this VTK build.'
+            )
+            raise RenderWindowUnavailable(msg)
+
+        _validation.check_instance(mesh, pv.PolyData, name='mesh')
+        if mesh.n_faces == 0:
+            msg = 'Surface LIC requires a PolyData mesh with faces, but the input mesh has none.'
+            raise ValueError(msg)
+
+        if vectors is None:
+            vectors = mesh.active_vectors_name
+        if vectors is None:
+            msg = (
+                'No point-data vector array was specified and the mesh has no '
+                'active vectors. Pass the array name with `vectors` or set '
+                'active vectors with `mesh.set_active_vectors(name)`.'
+            )
+            raise ValueError(msg)
+        if vectors not in mesh.point_data:
+            available = ', '.join(mesh.point_data.keys()) if mesh.point_data else 'none'
+            msg = (
+                f'Point-data vector array {vectors!r} does not exist. '
+                f'Available point arrays are: {available}.'
+            )
+            raise KeyError(msg)
+        vector_array = mesh.point_data[vectors]
+        if vector_array.ndim != 2 or vector_array.shape[1] != 3:
+            components = vector_array.shape[1] if vector_array.ndim == 2 else 1
+            msg = (
+                f'Vector array {vectors!r} has {components} components but '
+                'Surface LIC requires a three-component point vector array.'
+            )
+            raise ValueError(msg)
+
+        mapper = SurfaceLICMapper(theme=self.theme)
+        mapper.lic_number_of_steps = number_of_steps
+        mapper.lic_step_size = step_size
+        mapper.lic_enhance_contrast = enhance_contrast
+        if contrast_enhancement_factor is not None:
+            mapper.lic_contrast_enhancement_factor = contrast_enhancement_factor
+        mapper.lic_intensity = lic_intensity
+        mapper.lic_normalize_vectors = normalize_vectors
+
+        add_mesh_kwargs: dict[str, Any] = dict(
+            scalars=scalars,
+            color=color,
+            cmap=cmap,
+            clim=clim,
+            opacity=opacity,
+            show_scalar_bar=show_scalar_bar if scalars is not None else False,
+            scalar_bar_args=scalar_bar_args,
+            name=name,
+            render=render,
+            _mapper=mapper,
+        )
+        add_mesh_kwargs.update(kwargs)
+        actor = self.add_mesh(mesh, **add_mesh_kwargs)
+
+        # Without explicit scalars, never let an active scalar array color the
+        # surface; the LIC overlays the solid actor color instead.
+        if scalars is None:
+            actor.mapper.scalar_visibility = False
+        # add_mesh attaches the dataset to the mapper; select vectors after it.
+        cast('SurfaceLICMapper', actor.mapper).set_vectors(vectors)
         return actor
 
     def _add_legend_label(

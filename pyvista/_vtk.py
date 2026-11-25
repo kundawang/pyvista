@@ -806,6 +806,10 @@ _PLOTTING_MODULES: dict[str, tuple[str, ...]] = {
 #
 #     ImportError: libGL.so.1: cannot open shared object file: No such file or directory
 _OPENGL_MODULES: dict[str, tuple[str, ...]] = {
+    'vtkRenderingLICOpenGL2': (
+        'vtkSurfaceLICInterface',
+        'vtkSurfaceLICMapper',
+    ),
     'vtkRenderingOpenGL2': (
         'vtkCameraPass',
         'vtkCompositePolyDataMapper2',  # optional (contextlib.suppress)

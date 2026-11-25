@@ -73,6 +73,7 @@ Actors and Mappers
    plotting.mapper.PointGaussianMapper
    Prop3D
    Property
+   plotting.mapper.SurfaceLICMapper
 
 .. seealso::
 

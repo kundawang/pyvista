@@ -78,6 +78,7 @@ PLOTTING_VTKMODULES = CORE_VTKMODULES | {
     'vtkmodules.vtkRenderingFreeType',
     'vtkmodules.vtkRenderingHyperTreeGrid',
     'vtkmodules.vtkRenderingLabel',
+    'vtkmodules.vtkRenderingLICOpenGL2',
     'vtkmodules.vtkRenderingMatplotlib',
     'vtkmodules.vtkRenderingOpenGL2',
     'vtkmodules.vtkRenderingUI',

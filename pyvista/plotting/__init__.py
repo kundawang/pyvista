@@ -61,6 +61,7 @@ from .mapper import GPUVolumeRayCastMapper as GPUVolumeRayCastMapper
 from .mapper import OpenGLGPUVolumeRayCastMapper as OpenGLGPUVolumeRayCastMapper
 from .mapper import PointGaussianMapper as PointGaussianMapper
 from .mapper import SmartVolumeMapper as SmartVolumeMapper
+from .mapper import SurfaceLICMapper as SurfaceLICMapper
 from .mapper import UnstructuredGridVolumeRayCastMapper as UnstructuredGridVolumeRayCastMapper
 from .opts import PointSpriteShape as PointSpriteShape
 from .opts import ShaderType as ShaderType

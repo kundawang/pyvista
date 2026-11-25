@@ -7,6 +7,7 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from enum import IntEnum
+import importlib.util
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -57,7 +58,7 @@ if TYPE_CHECKING:
     from pyvista import DataObject
     from pyvista import DataSet  # noqa: F401
     from pyvista import ExplicitStructuredGrid  # noqa: F401
-    from pyvista import ImageData  # noqa: F401
+    from pyvista import ImageData
     from pyvista import MultiBlock  # noqa: F401
     from pyvista import PartitionedDataSet  # noqa: F401
     from pyvista import PolyData  # noqa: F401
@@ -2495,6 +2496,194 @@ class Nek5000Reader(BaseReader['UnstructuredGrid'], PointCellDataSelection, Time
         raise AttributeError(self._cell_attr_err_msg)
 
 
+_DICOM_DIRECTION_TOLERANCE = 1e-4
+
+
+def _dicom_direction_matrix(orientation: Sequence[float] | None) -> np.ndarray | None:
+    """Build the index-axis direction matrix from DICOM orientation cosines.
+
+    ``orientation`` is the six ``ImageOrientationPatient`` values: the row
+    direction cosines followed by the column direction cosines. Return
+    ``None`` when the metadata is missing or is not an orthonormal pair.
+    """
+    cosines = np.asarray(orientation, dtype=np.float64).ravel()
+    if cosines.shape != (6,) or not np.all(np.isfinite(cosines)):
+        return None
+    row_cosines = cosines[:3]
+    column_cosines = cosines[3:]
+    valid = (
+        np.isclose(np.linalg.norm(row_cosines), 1.0, rtol=0.0, atol=_DICOM_DIRECTION_TOLERANCE)
+        and np.isclose(
+            np.linalg.norm(column_cosines), 1.0, rtol=0.0, atol=_DICOM_DIRECTION_TOLERANCE
+        )
+        and np.isclose(
+            np.dot(row_cosines, column_cosines), 0.0, rtol=0.0, atol=_DICOM_DIRECTION_TOLERANCE
+        )
+    )
+    if not valid:
+        return None
+    normal = np.cross(row_cosines, column_cosines)
+    if not np.isclose(np.linalg.norm(normal), 1.0, rtol=0.0, atol=_DICOM_DIRECTION_TOLERANCE):
+        return None
+    return np.column_stack((row_cosines, column_cosines, normal))
+
+
+def _reorder_dicom_scalars(image: ImageData) -> None:
+    """Restore DICOM row, column and slice order in place.
+
+    ``vtkDICOMImageReader`` stores the last image row at index zero and orders
+    stack slices opposite to the orientation normal. Reverse the row and slice
+    axes so index ``(i, j, k)`` matches DICOM column, row and slice.
+    """
+    nx, ny, nz = image.dimensions
+    for name in list(image.point_data):
+        array = np.asarray(image.point_data[name])
+        if array.size != nx * ny * nz and array.shape[0] != nx * ny * nz:
+            continue
+        if array.ndim == 1:
+            reordered = np.ascontiguousarray(array.reshape(nz, ny, nx)[::-1, ::-1, :]).ravel()
+        else:
+            n_components = array.shape[1]
+            reordered = np.ascontiguousarray(
+                array.reshape(nz, ny, nx, n_components)[::-1, ::-1, :, :]
+            ).reshape(nx * ny * nz, n_components)
+        image.point_data[name] = reordered
+
+
+# Consecutive-slice progression tolerances (slices are uniform and normal-parallel).
+_DICOM_MIN_SLICE_STEP = 1e-6
+_DICOM_SLICE_PARALLEL_RTOL = 1e-3
+_DICOM_SLICE_UNIFORM_RTOL = 1e-3
+
+
+def _dicom_stack_origin(positions: list[np.ndarray], direction: np.ndarray) -> np.ndarray | None:
+    """Validate slice progression and return the minimum-normal-position origin."""
+    coords = np.asarray(positions, dtype=np.float64)
+    if coords.shape != (len(positions), 3) or not np.all(np.isfinite(coords)):
+        return None
+
+    normal = direction[:, 2]
+    order = np.argsort(coords @ normal)
+    coords = coords[order]
+    steps = np.diff(coords @ normal)
+    if steps.size and np.any(steps <= _DICOM_MIN_SLICE_STEP):
+        return None  # Duplicate or non-advancing slice positions.
+
+    deltas = np.diff(coords, axis=0)
+    lengths = np.linalg.norm(deltas, axis=1)
+    perpendicular = np.linalg.norm(deltas - steps[:, None] * normal, axis=1)
+    if np.any(perpendicular > _DICOM_SLICE_PARALLEL_RTOL * np.maximum(lengths, 1.0)):
+        return None  # Gantry tilt or another in-plane slice drift.
+
+    if steps.size:
+        spacing = np.median(steps)
+        if spacing <= 0.0 or np.any(
+            np.abs(steps - spacing) > _DICOM_SLICE_UNIFORM_RTOL * spacing + 1e-3
+        ):
+            return None  # Non-uniform gaps are not representable by ImageData spacing.
+
+    return coords[0]
+
+
+# Marks an environment without optional ``pydicom``.
+_PYDICOM_UNAVAILABLE = object()
+
+
+def _dicom_file_patient_tags(filename: Path) -> tuple[str, Any, np.ndarray] | None:
+    """Return ``(series_uid, orientation, position)`` for one DICOM file or ``None``."""
+    try:
+        from pydicom import dcmread  # noqa: PLC0415
+
+        dataset = dcmread(filename, stop_before_pixels=True, force=True)
+        iop = getattr(dataset, 'ImageOrientationPatient', None)
+        ipp = getattr(dataset, 'ImagePositionPatient', None)
+        if iop is None or ipp is None:
+            return None
+        position = np.asarray(list(ipp), dtype=np.float64).ravel()
+        if position.shape != (3,) or not np.all(np.isfinite(position)):
+            return None
+        return str(getattr(dataset, 'SeriesInstanceUID', '')), iop, position
+    except Exception:  # noqa: BLE001 - metadata scan must not fail the pixel read
+        return None
+
+
+def _read_dicom_patient_geometry(
+    path: str, n_slices: int
+) -> tuple[np.ndarray, np.ndarray] | object | None:
+    """Read DICOM patient geometry with optional ``pydicom``.
+
+    Return ``(origin, direction)``, ``None`` when the geometry is missing or
+    ambiguous, or :data:`_PYDICOM_UNAVAILABLE` when ``pydicom`` is not installed.
+
+    """
+    if importlib.util.find_spec('pydicom') is None:
+        return _PYDICOM_UNAVAILABLE
+
+    dicom_path = Path(path)
+    files = (
+        [dicom_path]
+        if dicom_path.is_file()
+        else sorted(item for item in dicom_path.iterdir() if item.is_file())
+    )
+
+    series: dict[str, list[tuple[Any, np.ndarray]]] = {}
+    for filename in files:
+        tags = _dicom_file_patient_tags(filename)
+        if tags is None:
+            continue
+        series_uid, iop, position = tags
+        series.setdefault(series_uid, []).append((iop, position))
+
+    geometries = []
+    for items in series.values():
+        # vtkDICOMImageReader stacks one series; its loaded slice count is ``nz``.
+        if len(items) != n_slices:
+            continue
+        direction = _dicom_direction_matrix(items[0][0])
+        if direction is None:
+            continue
+        origin = _dicom_stack_origin([position for _, position in items], direction)
+        if origin is not None:
+            geometries.append((origin, direction))
+
+    if not geometries:
+        return None
+    origin, direction = geometries[0]
+    if any(
+        not np.allclose(origin, other_origin, atol=1e-3)
+        or not np.allclose(direction, other_direction, atol=1e-5)
+        for other_origin, other_direction in geometries[1:]
+    ):
+        return None  # Several plausible series disagree.
+    return origin, direction
+
+
+def _apply_dicom_patient_geometry(image: ImageData, path: str) -> None:
+    """Set DICOM patient origin/direction and DICOM row/slice order in place."""
+    geometry = _read_dicom_patient_geometry(path, image.dimensions[2])
+    if geometry is _PYDICOM_UNAVAILABLE:
+        msg = (
+            'Install the optional "pydicom" package to place DICOM pixels in patient '
+            'coordinates from "ImagePositionPatient" and "ImageOrientationPatient"; '
+            'reading with the default origin and identity direction matrix.'
+        )
+        warn_external(msg, UserWarning)
+        return
+    if geometry is None:
+        msg = (
+            'DICOM "ImageOrientationPatient"/"ImagePositionPatient" geometry is missing, '
+            'inconsistent, or ambiguous. Reading with the default origin, identity '
+            'direction matrix, and native row order.'
+        )
+        warn_external(msg, UserWarning)
+        return
+
+    origin, direction = cast('tuple[np.ndarray, np.ndarray]', geometry)
+    image.direction_matrix = direction
+    image.origin = origin
+    _reorder_dicom_scalars(image)
+
+
 class DICOMReader(BaseReader['ImageData']):  # numpydoc ignore=PR02
     """Reader for the DICOM format (``.dcm``, ``.img``).
 
@@ -2502,6 +2691,16 @@ class DICOMReader(BaseReader['ImageData']):  # numpydoc ignore=PR02
 
     This reader reads a single file or a directory containing several ``.dcm``
     files (DICOM stack).
+
+    The :attr:`~pyvista.ImageData.origin` and
+    :attr:`~pyvista.ImageData.direction_matrix` are set from the DICOM
+    ``ImagePositionPatient`` and ``ImageOrientationPatient`` metadata so that
+    index ``(i, j, k)`` corresponds to column, row and slice. Pixel values are
+    unchanged. Patient geometry is read with the optional ``pydicom`` package.
+    When it is unavailable, or the metadata is missing, inconsistent (such as
+    gantry tilt or non-uniform slice spacing), or ambiguous, the image is
+    returned with the default origin, identity direction matrix and native row
+    order, and a :class:`UserWarning` is emitted.
 
     Parameters
     ----------
@@ -2535,6 +2734,24 @@ class DICOMReader(BaseReader['ImageData']):  # numpydoc ignore=PR02
 
     _vtk_class_name = 'vtkDICOMImageReader'
     _format = _formats.DICOM
+
+    def read(self, *, validate: bool | None = None) -> ImageData:
+        """Read the DICOM image and apply patient geometry.
+
+        Parameters
+        ----------
+        validate : bool, optional
+            Forwarded to :meth:`BaseReader.read`.
+
+        Returns
+        -------
+        pyvista.ImageData
+            Image with DICOM patient origin and direction applied.
+
+        """
+        image = super().read(validate=validate)
+        _apply_dicom_patient_geometry(image, self.path)
+        return image
 
 
 class BMPReader(BaseReader['ImageData']):

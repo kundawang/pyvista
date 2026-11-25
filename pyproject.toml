@@ -48,6 +48,7 @@ io = [
   'fsspec',
   'imageio',
   'meshio>=5.2',
+  'pydicom',
   'pyvista-frd-reader>=0.2.1',
   'pyvista-zstd>=0.3.1',
 ]
@@ -99,6 +100,7 @@ test = [
   'pandas<=2.4.0',
   'polars<=1.44.2',
   'pyarrow<26.0.0',
+  'pydicom<4',
   'pytest-cases<3.11.0',
   'pytest-codspeed<5.1.0',
   'pytest-cov<7.2.0',

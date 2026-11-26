@@ -7709,6 +7709,15 @@ class BasePlotter(_BoundsSizeMixin):
         """
         return self.picking.enable_rectangle_visible_picking(*args, **kwargs)
 
+    @functools.wraps(PickingComponent.enable_rectangle_point_picking)
+    def enable_rectangle_point_picking(self, *args, **kwargs) -> Any:  # numpydoc ignore=PR01,RT01
+        """Forward to ``PickingComponent.enable_rectangle_point_picking``.
+
+        See :meth:`~pyvista.plotting.picking.PickingComponent.enable_rectangle_point_picking`.
+
+        """
+        return self.picking.enable_rectangle_point_picking(*args, **kwargs)
+
     @functools.wraps(PickingComponent.enable_cell_picking)
     def enable_cell_picking(self, *args, **kwargs) -> Any:  # numpydoc ignore=PR01,RT01
         """Forward to :meth:`~pyvista.plotting.picking.PickingComponent.enable_cell_picking`."""
@@ -7792,6 +7801,15 @@ class BasePlotter(_BoundsSizeMixin):
 
         """
         return self.picking.picked_cells
+
+    @property
+    def picked_points(self) -> Any:  # numpydoc ignore=RT01
+        """Picked points.
+
+        Forwarded from :attr:`~pyvista.plotting.picking.PickingComponent.picked_points`.
+
+        """
+        return self.picking.picked_points
 
     @property
     def picked_block_index(self) -> Any:  # numpydoc ignore=RT01

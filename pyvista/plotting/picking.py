@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 
 PICKED_REPRESENTATION_NAMES = {
     'point': '_picked_point',
+    'points': '_picked_points',
     'mesh': '_picked_mesh',
     'through': '_picked_through_selection',
     'visible': '_picked_visible_selection',
@@ -316,6 +317,7 @@ class PickingComponent(_NoNewAttrMixin):
         self._picked_actor = None
         self._picked_mesh = None
         self._picked_cell: pv.MultiBlock | pv.UnstructuredGrid | None = None
+        self._picked_points: pv.MultiBlock | pv.PolyData | None = None
         self._picking_text = None
         self._picked_block_index = None
         # Path / geodesic / horizon state
@@ -366,6 +368,21 @@ class PickingComponent(_NoNewAttrMixin):
 
         """
         return self._picked_cell
+
+    @property
+    def picked_points(self) -> pv.PolyData | pv.MultiBlock | None:
+        r"""Return the rectangle point-picked object.
+
+        Returns
+        -------
+        output : None | pyvista.PolyData | pyvista.MultiBlock
+            Picked points if available. A :class:`~pyvista.PolyData` when a
+            single mesh was picked, a :class:`~pyvista.MultiBlock` otherwise.
+
+        .. versionadded:: 0.49.0
+
+        """
+        return self._picked_points
 
     @property
     def picked_block_index(self):  # numpydoc ignore=RT01
@@ -1375,6 +1392,167 @@ class PickingComponent(_NoNewAttrMixin):
             show_frustum=show_frustum,
             style=style,
             color=color,
+        )
+
+    @_deprecate_positional_args(allowed=['callback'])
+    def enable_rectangle_point_picking(  # noqa: PLR0917
+        self,
+        callback=None,
+        show=True,  # noqa: FBT002
+        color='pink',
+        point_size=10,
+        show_message=True,  # noqa: FBT002
+        font_size=18,
+        start=False,  # noqa: FBT002
+        show_frustum=False,  # noqa: FBT002
+        **kwargs,
+    ):
+        """Enable rectangle based picking at visible points.
+
+        Press ``"r"`` to enable rectangle based selection. Press ``"r"``
+        again to turn it off. Only points visible in the current viewport
+        are selected; points occluded by another surface are excluded.
+
+        The selection is saved to :attr:`picked_points
+        <pyvista.Plotter.picked_points>` as:
+
+        * a :class:`pyvista.PolyData` when a single mesh has been picked,
+        * a :class:`pyvista.MultiBlock` when multiple meshes have been picked.
+
+        Each block stores the world coordinates of the picked points and an
+        ``'original_point_ids'`` point array with the source point IDs.
+
+        .. versionadded:: 0.49.0
+
+        Parameters
+        ----------
+        callback : callable, optional
+            When input, calls this callable after a selection is made. The
+            :attr:`picked_points <pyvista.Plotter.picked_points>` is given as
+            the only parameter. The callback is not invoked when the
+            rectangle selects no points, in which case ``picked_points`` is
+            reset to ``None``.
+
+        show : bool, default: True
+            Show the selected points interactively.
+
+        color : ColorLike, default: "pink"
+            The color of the selected points when shown.
+
+        point_size : int, default: 10
+            Size of the selected points when shown.
+
+        show_message : bool | str, default: True
+            Show the message about how to use the point picking tool. If this
+            is a string, that will be the message shown.
+
+        font_size : int, default: 18
+            Sets the size of the message.
+
+        start : bool, default: False
+            Automatically start the point selection tool.
+
+        show_frustum : bool, default: False
+            Show the selection frustum in the scene.
+
+        **kwargs : dict, optional
+            All remaining keyword arguments are used to control how the
+            selected points are interactively displayed.
+
+        Examples
+        --------
+        Add a mesh and enable rectangle point picking.
+
+        >>> import pyvista as pv
+        >>> pl = pv.Plotter()
+        >>> _ = pl.add_mesh(pv.Sphere())
+        >>> _ = pl.enable_rectangle_point_picking()
+
+        """
+        self_ = weakref.ref(self)
+
+        def finalize(picked):
+            component = self_()
+            if component is None:
+                return
+            plotter = component._plotter
+            if picked is None:
+                with plotter.iren.poked_subplot():
+                    component._clear_picking_representations()
+                return
+
+            if show:
+                with plotter.iren.poked_subplot():
+                    _kwargs = kwargs.copy()
+                    plotter.add_mesh(
+                        picked,
+                        name=_kwargs.pop('name', PICKED_REPRESENTATION_NAMES['points']),
+                        color=color,
+                        point_size=point_size,
+                        pickable=_kwargs.pop('pickable', False),
+                        reset_camera=_kwargs.pop('reset_camera', False),
+                        **_kwargs,
+                    )
+
+            if callback is not None:
+                _poked_context_callback(plotter, callback, component.picked_points)
+
+        def point_pick_callback(selection):
+            component = self_()
+            if component is None:
+                return
+            plotter = component._plotter
+            picked = pv.MultiBlock()
+            renderer = plotter.iren.get_poked_renderer()
+            x0, y0, x1, y1 = renderer.get_pick_position()
+            if x0 >= 0:  # initial pick position is (-1, -1, -1, -1)
+                selector = _vtk.vtkOpenGLHardwareSelector()
+                selector.SetFieldAssociation(_vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS)
+                selector.SetRenderer(renderer)
+                selector.SetArea(x0, y0, x1, y1)
+                selection = selector.Select()
+
+                if selection is not None:
+                    for node in range(selection.GetNumberOfNodes()):
+                        selection_node = selection.GetNode(node)
+                        if selection_node is None:  # pragma: no cover
+                            continue
+                        pids = pv.convert_array(selection_node.GetSelectionList())
+                        actor = selection_node.GetProperties().Get(_vtk.vtkSelectionNode.PROP())
+                        mapper = actor.GetMapper()
+                        if not mapper or isinstance(mapper, CompositePolyDataMapper):
+                            continue
+
+                        source_mesh = pv.wrap(_mapper_get_data_set_input(mapper))
+                        # The hardware selector can report ids past the source mesh
+                        pids = pids[pids < source_mesh.n_points]
+                        if pids.size == 0:
+                            continue
+                        block = source_mesh.extract_points(
+                            pids, adjacent_cells=False, include_cells=False
+                        ).cast_to_poly_points()
+                        block.point_data['original_point_ids'] = block.point_data.pop(
+                            'vtkOriginalPointIds'
+                        )
+                        picked.append(block)
+
+                    selection.UnRegister(selection)
+
+            if len(picked) == 0 or picked.combine().n_points < 1:
+                component._picked_points = None
+            elif len(picked) == 1:
+                component._picked_points = picked[0]  # type: ignore[assignment]
+            else:
+                component._picked_points = picked
+
+            finalize(component._picked_points)
+
+        self.enable_rectangle_picking(
+            callback=point_pick_callback,
+            show_message=show_message,
+            font_size=font_size,
+            start=start,
+            show_frustum=show_frustum,
         )
 
     @_deprecate_positional_args(allowed=['callback'])

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import TYPE_CHECKING
+import warnings
 
 import numpy as np
 import pytest
@@ -296,6 +297,285 @@ def test_cell_picking_original_ids():
 def test_picked_cell_removed():
     pl = pv.Plotter()
     assert not hasattr(pl, 'picked_cell')
+
+
+def _display_position(pl, point):
+    """Project a world point to display coordinates in the active renderer."""
+    coordinate = _vtk.vtkCoordinate()
+    coordinate.SetValue(*point)
+    return coordinate.GetComputedDisplayValue(pl.renderer)
+
+
+def test_rectangle_point_picking_ids_and_coordinates():
+    """A rectangle selects the source IDs and world coordinates of visible points."""
+    points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]])
+    mesh = pv.PolyData(points)
+
+    picked_results = []
+    pl = pv.Plotter(window_size=(400, 400))
+    pl.add_mesh(mesh, point_size=15)
+    pl.enable_rectangle_point_picking(
+        callback=picked_results.append, show=False, show_message=False
+    )
+    pl.view_xy()
+    pl.show(auto_close=False, interactive=False)
+    width, height = pl.window_size
+
+    pl.iren._simulate_keypress('r')
+    pl.iren._mouse_left_button_press(0, 0)
+    pl.iren._mouse_left_button_release(width - 1, height - 1)
+
+    assert len(picked_results) == 1
+    picked = picked_results[0]
+    assert isinstance(picked, pv.PolyData)
+    assert pl.picked_points is picked
+    assert picked.n_points == 4
+    np.testing.assert_array_equal(picked.point_data['original_point_ids'], np.arange(4))
+    np.testing.assert_allclose(picked.points, points)
+
+    # A rectangle around a single point returns only that point's ID
+    display = _display_position(pl, points[2])
+    pl.iren._mouse_left_button_press(display[0] - 8, display[1] - 8)
+    pl.iren._mouse_left_button_release(display[0] + 8, display[1] + 8)
+    single = pl.picked_points
+    assert isinstance(single, pv.PolyData)
+    assert single.n_points == 1
+    assert single.point_data['original_point_ids'].tolist() == [2]
+    np.testing.assert_allclose(single.points, points[2:3])
+    pl.close()
+
+
+def test_rectangle_point_picking_occlusion():
+    """Points hidden behind a visible surface are not picked."""
+    plane = pv.Plane(center=(0.5, 0.5, 0.0), i_size=1.0, j_size=1.0)
+    back_points = np.array([[0.5, 0.5, -1.0], [2.0, 2.0, -1.0]])
+    back = pv.PolyData(back_points)
+
+    picked_results = []
+    pl = pv.Plotter(window_size=(400, 400))
+    pl.add_mesh(plane, color='red')
+    pl.add_mesh(back, color='blue', point_size=10)
+    pl.enable_rectangle_point_picking(
+        callback=picked_results.append, show=False, show_message=False
+    )
+    pl.view_xy()
+    pl.show(auto_close=False, interactive=False)
+    width, height = pl.window_size
+
+    pl.iren._simulate_keypress('r')
+    pl.iren._mouse_left_button_press(0, 0)
+    pl.iren._mouse_left_button_release(width - 1, height - 1)
+
+    picked = picked_results[0]
+    assert isinstance(picked, pv.MultiBlock)
+    assert isinstance(pl.picked_points, pv.MultiBlock)
+
+    # One block per source mesh; each block keeps its own source IDs
+    assert len(picked) == 2
+    back_block = next(b for b in picked if np.allclose(b.points, back_points[1:2]))
+    assert back_block.point_data['original_point_ids'].tolist() == [1]
+    plane_block = next(b for b in picked if b.n_points == plane.n_points)
+    np.testing.assert_array_equal(
+        plane_block.point_data['original_point_ids'], np.arange(plane.n_points)
+    )
+    pl.close()
+
+
+def test_rectangle_point_picking_empty_and_edge():
+    """Empty and window-edge rectangles behave correctly."""
+    points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]])
+    mesh = pv.PolyData(points)
+
+    picked_results = []
+    pl = pv.Plotter(window_size=(400, 400))
+    pl.add_mesh(mesh, point_size=15)
+    pl.enable_rectangle_point_picking(
+        callback=picked_results.append, show=False, show_message=False
+    )
+    pl.view_xy()
+    pl.show(auto_close=False, interactive=False)
+    width, height = pl.window_size
+
+    pl.iren._simulate_keypress('r')
+
+    # Full-window rectangle uses the window edges as bounds
+    pl.iren._mouse_left_button_press(0, 0)
+    pl.iren._mouse_left_button_release(width - 1, height - 1)
+    assert pl.picked_points.n_points == 4
+
+    # A rectangle in an empty area selects nothing and resets the picked state
+    pl.iren._mouse_left_button_press(195, 195)
+    pl.iren._mouse_left_button_release(205, 205)
+    assert pl.picked_points is None
+    assert len(picked_results) == 1  # callback is not invoked on empty selection
+
+    # A zero-size rectangle away from any point also selects nothing
+    pl.iren._mouse_left_button_press(200, 200)
+    pl.iren._mouse_left_button_release(200, 200)
+    assert pl.picked_points is None
+    pl.close()
+
+
+def test_rectangle_point_picking_subplot_attribution():
+    """Rectangle point picking in subplots attributes points to the poked renderer."""
+    left_points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    right_points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]])
+
+    picked_results = []
+    pl = pv.Plotter(shape=(1, 2), window_size=(600, 400))
+    pl.add_mesh(pv.PolyData(left_points), point_size=15)
+    pl.enable_rectangle_point_picking(
+        callback=picked_results.append, show=False, show_message=False
+    )
+    pl.subplot(0, 1)
+    pl.add_mesh(pv.PolyData(right_points), point_size=15)
+
+    pl.show(auto_close=False, interactive=False)
+    width, height = pl.window_size
+    half_width = width // 2
+
+    pl.iren._simulate_keypress('r')
+
+    # Drag covering the right subplot: only the right mesh is picked
+    pl.iren._mouse_left_button_press(half_width, 0)
+    pl.iren._mouse_left_button_release(width - 1, height - 1)
+    right_picked = picked_results[-1]
+    assert isinstance(right_picked, pv.PolyData)
+    assert right_picked.n_points == 3
+    np.testing.assert_array_equal(right_picked.point_data['original_point_ids'], np.arange(3))
+
+    # Drag covering the left subplot: only the left mesh is picked
+    pl.iren._mouse_left_button_press(0, 0)
+    pl.iren._mouse_left_button_release(half_width - 1, height - 1)
+    left_picked = picked_results[-1]
+    assert isinstance(left_picked, pv.PolyData)
+    assert left_picked.n_points == 2
+    np.testing.assert_array_equal(left_picked.point_data['original_point_ids'], np.arange(2))
+    pl.close()
+
+
+def test_rectangle_point_picking_show_representation():
+    """The selected-points representation is added, replaced, and cleared."""
+    points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]])
+    mesh = pv.PolyData(points)
+
+    pl = pv.Plotter(window_size=(400, 400))
+    pl.add_mesh(mesh, point_size=15)
+    pl.enable_rectangle_point_picking(show=True, show_message=False, color='blue', point_size=20)
+    pl.view_xy()
+    pl.show(auto_close=False, interactive=False)
+    width, height = pl.window_size
+
+    pl.iren._simulate_keypress('r')
+    pl.iren._mouse_left_button_press(0, 0)
+    pl.iren._mouse_left_button_release(width - 1, height - 1)
+    assert pl.renderer.actors['_picked_points'] is not None
+
+    # A second selection replaces rather than duplicates the representation
+    pl.iren._mouse_left_button_press(0, 0)
+    pl.iren._mouse_left_button_release(width // 2, height // 2)
+    assert sum(name == '_picked_points' for name in pl.renderer.actors) == 1
+
+    # An empty selection clears the representation
+    pl.iren._mouse_left_button_press(195, 195)
+    pl.iren._mouse_left_button_release(205, 205)
+    assert pl.picked_points is None
+    assert '_picked_points' not in pl.renderer.actors
+    pl.close()
+
+
+@pytest.mark.parametrize(
+    'mesh',
+    [
+        pv.PointSet([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]]),
+        pv.ImageData(dimensions=(2, 2, 1)),
+        pv.Cube().cast_to_unstructured_grid(),
+    ],
+)
+def test_rectangle_point_picking_dataset_types(mesh):
+    """Points are returned as PolyData for any pickable dataset type."""
+    pl = pv.Plotter(window_size=(400, 400))
+    pl.add_mesh(mesh)
+    pl.enable_rectangle_point_picking(show=False, show_message=False)
+    pl.show(auto_close=False, interactive=False)
+    width, height = pl.window_size
+
+    pl.iren._simulate_keypress('r')
+    pl.iren._mouse_left_button_press(0, 0)
+    pl.iren._mouse_left_button_release(width - 1, height - 1)
+
+    picked = pl.picked_points
+    assert isinstance(picked, pv.PolyData)
+    assert 0 < picked.n_points <= mesh.n_points
+    ids = picked.point_data['original_point_ids']
+    assert np.all(ids >= 0)
+    assert np.all(ids < mesh.n_points)
+    np.testing.assert_allclose(picked.points, mesh.points[ids])
+    pl.close()
+
+
+def test_rectangle_point_picking_non_pickable_actor():
+    """Non-pickable actors are excluded from the selection."""
+    pickable = pv.PolyData(
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]])
+    )
+    non_pickable = pv.Sphere(center=(0.5, 0.5, 0.0))
+
+    pl = pv.Plotter(window_size=(400, 400))
+    pl.add_mesh(non_pickable, pickable=False, opacity=0.3)
+    pl.add_mesh(pickable, point_size=15)
+    pl.enable_rectangle_point_picking(show=False, show_message=False)
+    pl.view_xy()
+    pl.show(auto_close=False, interactive=False)
+    width, height = pl.window_size
+
+    pl.iren._simulate_keypress('r')
+    pl.iren._mouse_left_button_press(0, 0)
+    pl.iren._mouse_left_button_release(width - 1, height - 1)
+
+    picked = pl.picked_points
+    assert isinstance(picked, pv.PolyData)
+    assert picked.n_points == pickable.n_points
+    np.testing.assert_array_equal(
+        picked.point_data['original_point_ids'], np.arange(pickable.n_points)
+    )
+    pl.close()
+
+
+def test_rectangle_point_picking_composite_actor_skipped():
+    """A composite-mapper actor is skipped without breaking other selections."""
+    composite = pv.MultiBlock([pv.Cube(center=(10.0, 10.0, 10.0))])
+    points = pv.PolyData(
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]])
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')  # a swallowed callback traceback would fail here
+        pl = pv.Plotter(window_size=(400, 400))
+        pl.add_composite(composite)
+        pl.add_mesh(points, point_size=15)
+        pl.enable_rectangle_point_picking(show=False, show_message=False)
+        pl.view_xy()
+        pl.show(auto_close=False, interactive=False)
+        width, height = pl.window_size
+
+        pl.iren._simulate_keypress('r')
+        pl.iren._mouse_left_button_press(0, 0)
+        pl.iren._mouse_left_button_release(width - 1, height - 1)
+
+    assert isinstance(pl.picked_points, pv.PolyData)
+    assert pl.picked_points.n_points == points.n_points
+    pl.close()
+
+
+def test_rectangle_point_picking_forward():
+    """The plotter method and attribute forward from the picking component."""
+    pl = pv.Plotter()
+    assert pl.picked_points is pl.picking.picked_points
+    assert pl.picked_points is None
+    pl.add_mesh(pv.Sphere())
+    assert pl.enable_rectangle_point_picking(show_message=False) is None
+    pl.close()
 
 
 def test_cell_picking_interactive_subplot():

@@ -185,6 +185,107 @@ class _ExtractValuesInputs(NamedTuple):
     component_logic: Callable[[NumpyArray[np.bool_]], NumpyArray[np.bool_]] | None
 
 
+def _cylinder_glyph_direction(
+    dataset: DataSet,
+    direction: str | MatrixLike[float] | VectorLike[float] | None,
+    n_points: int,
+) -> NumpyArray[float]:
+    """Resolve per-point unit direction vectors for cylinder glyphs."""
+    if direction is None:
+        active_name = dataset.active_vectors_name
+        if active_name is not None and active_name in dataset.point_data:
+            direction = active_name
+        else:
+            return np.broadcast_to(np.array((1.0, 0.0, 0.0)), (n_points, 3)).copy()
+
+    if isinstance(direction, str):
+        if direction not in dataset.point_data:
+            msg = f'Missing direction point-data array {direction!r}.'
+            raise KeyError(msg)
+        array = np.asarray(dataset.point_data[direction], dtype=float)
+    else:
+        array = np.asarray(direction, dtype=float)
+
+    if array.shape == (3,):
+        array = np.broadcast_to(array, (n_points, 3)).copy()
+    if array.shape != (n_points, 3):
+        msg = (
+            f"'direction' must have shape {(n_points, 3)} or (3,); "
+            f'got array with shape {array.shape}.'
+        )
+        raise ValueError(msg)
+    if not np.all(np.isfinite(array)):
+        msg = "'direction' must contain only finite values (no NaN or inf)."
+        raise ValueError(msg)
+
+    norms = np.linalg.norm(array, axis=1)
+    if np.any(norms == 0.0):
+        msg = "'direction' vectors must have nonzero magnitude."
+        raise ValueError(msg)
+    return array / norms[:, np.newaxis]
+
+
+def _cylinder_glyph_measure(
+    dataset: DataSet,
+    value: str | VectorLike[float] | float | None,
+    n_points: int,
+    *,
+    name: str,
+    default: float,
+) -> NumpyArray[float]:
+    """Resolve a per-point length or radius array."""
+    if value is None:
+        array = np.full(n_points, default, dtype=float)
+    elif isinstance(value, str):
+        if value not in dataset.point_data:
+            msg = f'Missing {name} point-data array {value!r}.'
+            raise KeyError(msg)
+        array = np.asarray(dataset.point_data[value], dtype=float)
+    else:
+        array = np.asarray(value, dtype=float)
+
+    if array.ndim == 0:
+        array = np.full(n_points, float(array), dtype=float)
+    elif array.shape == (n_points, 1):
+        array = array.reshape(n_points)
+    if array.shape != (n_points,):
+        msg = f"'{name}' must have shape {(n_points,)}; got array with shape {array.shape}."
+        raise ValueError(msg)
+    if not np.all(np.isfinite(array)):
+        msg = f"'{name}' must contain only finite values (no NaN or inf)."
+        raise ValueError(msg)
+    if np.any(array < 0.0):
+        msg = f"'{name}' must be nonnegative; negative values are not valid."
+        raise ValueError(msg)
+    return array
+
+
+def _cylinder_glyph_scalars(
+    dataset: DataSet,
+    scalars: str | VectorLike[float] | None,
+    n_points: int,
+) -> tuple[str | None, NumpyArray[Any] | None]:
+    """Resolve the color scalars to copy onto every source point of each glyph."""
+    if scalars is None:
+        active_name = dataset.active_scalars_name
+        if active_name is not None and active_name in dataset.point_data:
+            scalars = active_name
+        else:
+            return None, None
+
+    if isinstance(scalars, str):
+        if scalars not in dataset.point_data:
+            msg = f'Missing scalar point-data array {scalars!r}.'
+            raise KeyError(msg)
+        return scalars, np.asarray(dataset.point_data[scalars])
+
+    values = np.asarray(scalars)
+    if values.shape[0] != n_points:
+        msg = f"'scalars' must have one value per point ({n_points}); got {values.shape[0]}."
+        raise ValueError(msg)
+    return '_cylinder_glyph_scalars', values
+
+
 @abstract_class
 class DataSetFilters(DataObjectFilters):
     """A set of common filters that can be applied to any :vtk:`vtkDataSet`."""
@@ -1978,6 +2079,9 @@ class DataSetFilters(DataObjectFilters):
         rng: VectorLike[float] | None = None,
         color_mode: Literal['scale', 'scalar', 'vector'] = 'scale',
         progress_bar: bool = False,  # noqa: FBT001, FBT002
+        *,
+        length: str | VectorLike[float] | float | None = None,
+        radius: str | VectorLike[float] | float | None = None,
     ):
         """Copy a geometric representation (called a glyph) to the input dataset.
 
@@ -2051,6 +2155,18 @@ class DataSetFilters(DataObjectFilters):
         progress_bar : bool, default: False
             Display a progress bar to indicate progress.
 
+        length : str or array_like or float, optional
+            Independent per-glyph axial lengths. When supplied together with
+            ``radius`` (or when only one of the two is given), the call is
+            handled by :meth:`cylinder_glyph` and the uniform scaling described
+            by ``scale`` is not applied. If ``length`` is omitted while
+            ``radius`` is given and ``scale`` names an array, that array is
+            used for the lengths.
+
+        radius : str or array_like or float, optional
+            Independent per-glyph radial sizes. See ``length`` for when this
+            dispatches to :meth:`cylinder_glyph`.
+
         Returns
         -------
         pyvista.PolyData
@@ -2077,6 +2193,32 @@ class DataSetFilters(DataObjectFilters):
 
         """
         dataset = self
+
+        # Independent axial/radial sizing is implemented by cylinder_glyph;
+        # leaving both new parameters unset keeps the uniform glyph path below.
+        if length is not None or radius is not None:
+            if orient is False:
+                cylinder_direction: str | MatrixLike[float] | VectorLike[float] | None = np.tile(
+                    (1.0, 0.0, 0.0), (dataset.n_points, 1)
+                )
+            elif orient is True or orient is None:
+                cylinder_direction = None
+            else:
+                cylinder_direction = orient
+
+            cylinder_length = length
+            if cylinder_length is None and isinstance(scale, str):
+                cylinder_length = scale
+
+            cylinder_geom = geom if isinstance(geom, pv.PolyData) else None
+            return dataset.cylinder_glyph(
+                direction=cylinder_direction,
+                length=cylinder_length,
+                radius=radius,
+                factor=factor,
+                geom=cylinder_geom,
+                progress_bar=progress_bar,
+            )
 
         # Make glyphing geometry if necessary
         if geom is None:
@@ -2246,6 +2388,195 @@ class DataSetFilters(DataObjectFilters):
         # Storing geom on the algorithm, for later use in legends.
         output._glyph_geom = geoms
 
+        return output
+
+    def cylinder_glyph(  # type: ignore[misc]
+        self: _DataSetType,
+        direction: str | MatrixLike[float] | VectorLike[float] | None = None,
+        length: str | VectorLike[float] | float | None = None,
+        radius: str | VectorLike[float] | float | None = None,
+        *,
+        scalars: str | VectorLike[float] | None = None,
+        resolution: int = 20,
+        capping: bool = True,
+        centered: bool = True,
+        factor: float = 1.0,
+        geom: PolyData | None = None,
+        progress_bar: bool = False,
+    ) -> PolyData:
+        """Copy cylinder glyphs onto points with independent length and radius.
+
+        Unlike :meth:`glyph`, whose single scale factor resizes every dimension
+        together, this filter sizes the cylinder axis from ``length`` and its
+        two radial axes from ``radius`` independently. Every cylinder is
+        generated in a single :vtk:`vtkTensorGlyph` pass, so a large field is
+        batched instead of building and merging one tube per point.
+
+        Parameters
+        ----------
+        direction : str or array_like, optional
+            Name of a point-data vector array or an ``(n_points, 3)`` array
+            giving each cylinder axis. A single ``(3,)`` vector is broadcast to
+            every point. When ``None``, the active point vectors are used; if
+            there are none, the positive x-axis is used.
+
+        length : str or array_like or float, optional
+            Name of a point-data array, a per-point array, or a scalar giving
+            the total axial length of each cylinder. Defaults to ``1.0``. Zero
+            produces a flat, degenerate glyph; negative or non-finite values
+            raise ``ValueError``.
+
+        radius : str or array_like or float, optional
+            Name of a point-data array, a per-point array, or a scalar giving
+            the radius of each cylinder. Defaults to ``0.5``. Zero collapses
+            the glyph onto its axis; negative or non-finite values raise
+            ``ValueError``.
+
+        scalars : str or array_like, optional
+            Point-data scalars to copy onto the generated cylinders for
+            coloring. When ``None``, the active point scalars are used if
+            present.
+
+        resolution : int, default: 20
+            Number of facets around each cylinder.
+
+        capping : bool, default: True
+            Whether to cap the cylinder ends.
+
+        centered : bool, default: True
+            Place the cylinder center on each input point. When ``False``, the
+            point anchors the start and the cylinder extends along
+            ``direction``.
+
+        factor : float, default: 1.0
+            Additional factor applied to both ``length`` and ``radius``.
+
+        geom : pyvista.PolyData, optional
+            Cylinder geometry oriented along the positive x-axis and centered
+            at the origin. Its axial and radial extents are normalized to
+            ``length`` and ``radius``. By default a unit cylinder is built from
+            ``resolution`` and ``capping``.
+
+        progress_bar : bool, default: False
+            Display a progress bar to indicate progress.
+
+        Returns
+        -------
+        pyvista.PolyData
+            The batched cylinder glyphs. An empty input returns an empty
+            :class:`pyvista.PolyData`.
+
+        Raises
+        ------
+        KeyError
+            If a named point-data array is missing.
+        TypeError
+            If ``geom`` is not a :class:`pyvista.PolyData`.
+        ValueError
+            If an array has the wrong shape, holds non-finite or negative
+            values, or a direction has zero magnitude.
+
+        Examples
+        --------
+        Place two orthogonal cylinders and check the combined bounds.
+
+        >>> import pyvista as pv
+        >>> points = [[0.0, 0.0, 0.0], [0.0, 4.0, 0.0]]
+        >>> mesh = pv.PolyData(points)
+        >>> glyphs = mesh.cylinder_glyph(
+        ...     direction=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        ...     length=[2.0, 3.0],
+        ...     radius=[0.5, 0.25],
+        ...     resolution=20,
+        ... )
+        >>> tuple(round(float(v), 3) for v in glyphs.bounds)
+        (-1.0, 1.0, -0.5, 5.5, -0.5, 0.5)
+        >>> glyphs.n_points > mesh.n_points
+        True
+
+        """
+        n_points = self.n_points
+        if n_points == 0:
+            return pv.PolyData()
+
+        directions = _cylinder_glyph_direction(self, direction, n_points)
+        lengths = _cylinder_glyph_measure(self, length, n_points, name='length', default=1.0)
+        radii = _cylinder_glyph_measure(self, radius, n_points, name='radius', default=0.5)
+        scalar_name, scalar_values = _cylinder_glyph_scalars(self, scalars, n_points)
+
+        if geom is None:
+            center_x = 0.0 if centered else 0.5
+            geom = pv.Cylinder(
+                center=(center_x, 0.0, 0.0),
+                direction=(1.0, 0.0, 0.0),
+                radius=1.0,
+                height=1.0,
+                capping=capping,
+                resolution=resolution,
+            )
+        elif not isinstance(geom, pv.PolyData):
+            msg = 'Only a PolyData can be used as cylinder glyph geometry.'
+            raise TypeError(msg)
+
+        geom_bounds = geom.bounds
+        axial_extent = geom_bounds.x_max - geom_bounds.x_min
+        radial_extent = max(
+            abs(geom_bounds.y_min),
+            abs(geom_bounds.y_max),
+            abs(geom_bounds.z_min),
+            abs(geom_bounds.z_max),
+        )
+        if not np.isfinite(axial_extent) or axial_extent <= 0.0:
+            msg = 'Cylinder glyph geometry must have a nonzero x-axis extent.'
+            raise ValueError(msg)
+        if not np.isfinite(radial_extent) or radial_extent <= 0.0:
+            msg = 'Cylinder glyph geometry must have a nonzero radial extent.'
+            raise ValueError(msg)
+
+        # vtkTensorGlyph applies the flattened 3x3 tensor row-wise to the
+        # template, so each row is one transformed template axis. The first
+        # row maps the cylinder x-axis to the oriented length; the other two
+        # span the radial plane.
+        reference = np.empty_like(directions)
+        use_z_axis = np.abs(directions[:, 2]) < 0.9
+        reference[use_z_axis] = (0.0, 0.0, 1.0)
+        reference[~use_z_axis] = (1.0, 0.0, 0.0)
+        radial_u = np.cross(reference, directions)
+        radial_u /= np.linalg.norm(radial_u, axis=1, keepdims=True)
+        radial_v = np.cross(directions, radial_u)
+
+        axial_scale = lengths * factor / axial_extent
+        radial_scale = radii * factor / radial_extent
+        tensor = np.empty((n_points, 9), dtype=float)
+        tensor[:, 0:3] = directions * axial_scale[:, np.newaxis]
+        tensor[:, 3:6] = radial_u * radial_scale[:, np.newaxis]
+        tensor[:, 6:9] = radial_v * radial_scale[:, np.newaxis]
+
+        source_data = pv.PolyData(self.points)
+        tensor_name = '_cylinder_glyph_tensor'
+        source_data.point_data[tensor_name] = tensor
+
+        alg = _vtk.vtkTensorGlyph()
+        alg.SetInputDataObject(source_data)
+        alg.SetSourceData(geom)
+        alg.SetInputArrayToProcess(
+            0,
+            0,
+            0,
+            FieldAssociation.POINT.value,
+            tensor_name,
+        )
+        alg.ExtractEigenvaluesOff()
+        alg.ColorGlyphsOff()
+        alg.SetScaleFactor(1.0)
+        _update_alg(alg, progress_bar=progress_bar, message='Computing Cylinder Glyphs')
+        output = _get_output(alg, keep_pointset=False)
+
+        if scalar_name is not None and scalar_values is not None:
+            output.point_data[scalar_name] = np.repeat(scalar_values, geom.n_points, axis=0)
+            output.set_active_scalars(scalar_name)
+
+        output._glyph_geom = [geom]
         return output
 
     # fmt: off

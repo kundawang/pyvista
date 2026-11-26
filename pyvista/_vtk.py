@@ -367,6 +367,7 @@ _CORE_MODULES: dict[str, tuple[str, ...]] = {
         'vtkStaticCleanUnstructuredGrid',
         'vtkStripper',
         'vtkSurfaceNets3D',
+        'vtkTensorGlyph',
         'vtkThreshold',
         'vtkTriangleFilter',
         'vtkTubeFilter',
